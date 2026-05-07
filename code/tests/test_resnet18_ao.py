@@ -323,29 +323,74 @@ def train(num_epoch=10, option='normal', autocast=False):
         toc = time.time()
         duration = toc - tic
         print(f"\nEpoch completed in {duration:.4f}s\n")
-    return duration
+    return duration, model
 
+def test(model, option='normal'):
+    batch_size = 64
+
+    from eneuro.base.core import Tensor
+    from eneuro.data import DataLoader
+    import time
+    # 实例化数据集
+    dataset = SteeringDataset(
+        root_dir="code/tests/testdata/data",
+        transform=lambda x: x.transpose(2, 0, 1)   # 可选：将 (H,W,C) 转为 (C,H,W)
+    )
+
+    # 配合 DataLoader 使用
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    tic = time.time()
+
+    print('test start')
+    for batch_idx, (images, labels) in enumerate(dataloader):
+        # images: Tensor (B, C, H, W) 或 (B, H, W, C)
+        # labels: Tensor (B,)
+        sys.stdout.write(
+            f'\rBatch {batch_idx+1:3d}/{len(dataset)}'
+        )
+        sys.stdout.flush()
+
+        if option == 'normal':
+            y_pre = model(images)
+        elif option == 'quantize':
+            y_pre = model.forward(images)
+        
+        break
+      
+    toc = time.time()
+    duration = toc - tic
+    print(f"\nTest completed in {duration:.4f}s\n")
+    return duration
 
 if __name__ == '__main__':
     #test_resnet18_forward_backward()
+    
+    from eneuro.data import DataLoader
+    batch_size = 64
+    dataset = SteeringDataset(
+        root_dir="code/tests/testdata/sampledata",
+        transform=lambda x: x.transpose(2, 0, 1)
+    )
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-    normal_t = train(num_epoch=1, option='normal', autocast=False)
-    cast_t = train(num_epoch=1, option='normal', autocast=True)
-    sub = normal_t - cast_t
-    print(f"normal training complete in {normal_t:.4f}s")
-    print(f"autocast normal training complete in {cast_t:.4f}s")
-    print(f"混合精度节约了 {sub * 100 / normal_t:.2f}% 的时间")
-    
-    normal_t = train(num_epoch=1, option='graph', autocast=False)
-    cast_t = train(num_epoch=1, option='graph', autocast=True)
-    sub = normal_t - cast_t
-    print(f"graph training complete in {normal_t:.4f}s")
-    print(f"autocast graph training complete in {cast_t:.4f}s")
-    print(f"混合精度节约了 {sub * 100 / normal_t:.2f}% 的时间")
-    
-    normal_t = train(num_epoch=1, option='optim_graph', autocast=False)
-    cast_t = train(num_epoch=1, option='optim_graph', autocast=True)
-    sub = normal_t - cast_t
-    print(f"optim_graph training complete in {normal_t:.4f}s")
-    print(f"autocast optim_graph training complete in {cast_t:.4f}s")
-    print(f"混合精度节约了 {sub * 100 / normal_t:.2f}% 的时间")
+    sample_input = None
+    for batch_idx, (images, labels) in enumerate(dataloader):
+        sample_input = images
+        break
+
+    _, model = train(num_epoch=1, option='normal', autocast=False)
+    normal_t = test(model=model, option='normal')
+
+    graphoptim = GraphOptimizer(model=model, sample_input=sample_input)
+    graph = graphoptim.origin_graph()
+    graph.visualize('origin_graph.dot')
+
+    executor = graphoptim.quantize_to_executor(cal_loader=dataloader, dtype=np.int8)
+    graph = executor.graph
+    graph.visualize('quantize_graph.dot')
+
+    quantize_t = test(model=model, option='quantize')
+    sub = normal_t - quantize_t
+    print(f"normal prediction complete in {normal_t:.4f}s")
+    print(f"quantize_t prediction complete in {quantize_t:.4f}s")
+    print(f"量化模型节约了 {sub * 100 / normal_t:.2f}% 的时间")

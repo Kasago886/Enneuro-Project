@@ -8,6 +8,8 @@ class GraphExecutor:
     def __init__(self, graph: Graph):
         self.graph = graph
         self.topo_order = graph.topological_order()
+
+        self.quantize_record = False
         
         # 1. 识别参数节点和数据输入节点
         self.param_nodes: List[Node] = []      # Parameter 节点
@@ -55,6 +57,19 @@ class GraphExecutor:
                 self.graph.nodes[pred_id] for pred_id in self.graph.input_edges[node.id]
             ]
             input_tensors = [cache[in_node.id] for in_node in input_nodes]
+
+            # 记录输入 Tensor 节点的rmin, rmax
+            if self.quantize_record:
+                for input_node, input_tensor in zip(input_nodes, input_tensors):
+                    if input_node.rmax is not None:
+                        input_node.rmax = max(input_tensor.data.max(), input_node.rmax)
+                    else:
+                        input_node.rmax = input_tensor.data.max()
+
+                    if input_node.rmin is not None:
+                        input_node.rmin = min(input_tensor.data.min(), input_node.rmin)
+                    else:
+                        input_node.rmin = input_tensor.data.min()
             
             # 调用 Function（自动建立计算图，支持反向传播）
             outputs = func(*input_tensors)
@@ -82,3 +97,14 @@ class GraphExecutor:
         ]
         results = [cache[n.id] for n in output_nodes]
         return results[0] if len(results) == 1 else results
+
+    def clear_record(self):
+        for node in self.graph.tensor_nodes.values():
+            node.rmax = None
+            node.rmin = None
+
+    def forward_record(self, *inputs):
+        origin_flag = self.quantize_record
+        self.quantize_record = True
+        _ = self.forward(*inputs)
+        self.quantize_record = origin_flag

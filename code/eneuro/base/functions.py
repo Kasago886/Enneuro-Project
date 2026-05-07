@@ -1925,3 +1925,51 @@ class DeCast(Function):
 
 def decast(x):
     return DeCast()(*x)
+
+class QuantizeRegistry:
+    can_quantize = [
+        Conv2d,
+        GroupedConv2d,
+        Deconv2d,
+        MatMul,
+        Linear,
+        FusedConvReLU
+    ]
+
+class Quantize(Function):
+    """将浮点张量量化为整数张量"""
+    def __init__(self, scale, zero_point, dtype=np.int8):
+        self.scale = scale
+        self.zero_point = zero_point
+        self.dtype = dtype
+
+    def forward(self, *xs):
+        qs = []
+        for x in xs:
+            q = np.round(x / self.scale + self.zero_point)
+            q = np.clip(q, np.iinfo(self.dtype).min, np.iinfo(self.dtype).max).astype(self.dtype)
+            qs.append(q)
+        return tuple(qs)
+
+    def backward(self, gys):
+        return gys
+
+def quantize(x, scale, zero_point, dtype=np.int8):
+    return Quantize(scale, zero_point, dtype)(x)
+
+class Dequantize(Function):
+    """将整数张量反量化为浮点张量"""
+    def __init__(self, scale, zero_point):
+        self.scale = scale
+        self.zero_point = zero_point
+
+    def forward(self, *xs):
+        qs = [(x.astype(np.float32) - self.zero_point) * self.scale 
+              for x in xs]
+        return tuple(qs)
+
+    def backward(self, gys):
+        return gys
+
+def dequantize(x, scale, zero_point):
+    return Dequantize(scale, zero_point)(x)

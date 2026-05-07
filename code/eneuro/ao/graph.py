@@ -20,6 +20,11 @@ class Node:
         self.name = getattr(obj, 'name', None) or obj.__class__.__name__
         self.params = None
 
+        # quantize record
+        if node_type == NodeType.TENSOR:
+            self.rmin = obj.data.min()
+            self.rmax = obj.data.max()
+
     def __repr__(self):
         return f"Node(id={self.id}, type={self.type.name}, name={self.name})"
 

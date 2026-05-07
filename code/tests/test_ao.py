@@ -14,6 +14,17 @@ from eneuro.nn.loss import CrossEntropyLoss
 from eneuro.nn.optim import SGD
 from eneuro.ao import GraphOptimizer,GraphExecutor,trace_context, autocast_context, GradScaler
 from eneuro.utils import save_checkpoint,load_checkpoint
+from eneuro.data import Dataset,DataLoader
+
+class SampleDataset(Dataset):
+    def __init__(self, X):
+        self.X = X
+    
+    def __getitem__(self, index):
+        return 
+    
+    def __len__(self):
+        return 1
 
 # 创建简单的测试数据
 size = 32
@@ -282,6 +293,41 @@ def test_autocast_ao(epoch_num = 10):
     #graph = op.optimize() # 优化后的图
     #graph.visualize('optimized_graph.dot') # 保存为.dot文件便于查看
     executor = op.optimize_to_executor() # 优化后的执行器
+
+    # 创建损失函数和优化器
+    loss_fn = CrossEntropyLoss()
+    optimizer = SGD(model.params(), lr=0.1)
+    scaler = GradScaler()
+    
+    tic = time.time()
+    for epoch in range(epoch_num):
+        with autocast_context():
+            y_hat = executor.forward(Tensor(X)) # 使用执行器进行前向传播
+            loss = loss_fn(y_hat, Tensor(y))
+        
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+
+    toc = time.time()
+    duration = toc - tic
+
+    #save_checkpoint(model, optimizer, num_epoch, "ao_checkpoint.json") # 正常保存
+    #print(f"ao training complete in {duration:.4f}s  loss = {loss}")
+    
+    return duration
+
+def test_quantize(epoch_num = 10):
+    from eneuro.ao import GraphOptimizer
+    # 创建模型
+    model = Sequential(*sequential_content)
+
+    # 执行一次前向，记录并优化计算图（得到优化后的 executor）
+    sample_input = Tensor(X) # 样例输入
+    op = GraphOptimizer(model, sample_input) # 图优化器
+    #graph = op.optimize() # 优化后的图
+    #graph.visualize('optimized_graph.dot') # 保存为.dot文件便于查看
+    dataset = Dataset()
+    executor = op.quantize_to_executor() # 优化后的执行器
 
     # 创建损失函数和优化器
     loss_fn = CrossEntropyLoss()
