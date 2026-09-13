@@ -87,7 +87,7 @@ def test_executor(epoch_num = 10):
     #graph.visualize('origin_graph.dot')
     executor = GraphOptimizer.graph_to_executor(graph)
 
-    Serializer.load(executor, 'test_executor_save.json')
+    #Serializer.load(executor, 'test_executor_save.json')
 
     # 创建损失函数和优化器
     loss_fn = CrossEntropyLoss()
@@ -116,7 +116,7 @@ def test_executor(epoch_num = 10):
     duration = toc - tic
     print(f"executor testing complete in {duration:.4f}s")
 
-    Serializer.save(executor, 'test_executor_save.json')
+    #Serializer.save(executor, 'test_executor_save.json')
 
     return duration
 
