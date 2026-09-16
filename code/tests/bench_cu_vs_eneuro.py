@@ -2,7 +2,7 @@
 """CUDA 基础算子 vs EnNeuro(CPU / GPU) 等价过程 耗时对比
 
 对比三方：
-  1. CUDA(dll)      —— code/cuda/cu/*.cu 编译出的算子动态库（每次调用都做
+  1. CUDA(dll)      —— code/eneuro/cuda/cu/*.cu 编译出的算子动态库（每次调用都做
                        cudaMalloc → H2D → kernel → D2H → cudaFree）
   2. EnNeuro(CPU)   —— eneuro.base.Tensor 跑在 numpy 后端
   3. EnNeuro(GPU)   —— eneuro.base.Tensor 跑在 cupy 后端（数据常驻显存，不含拷贝）
@@ -36,7 +36,7 @@ ROOT = Path(__file__).resolve().parents[1]          # .../code
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-LIB_DIR = ROOT / "cuda" / ("dll" if os.name == "nt" else "so")
+LIB_DIR = ROOT / "eneuro" / "cuda" / ("dll" if os.name == "nt" else "so")
 EXT = "dll" if os.name == "nt" else "so"
 
 FP = ctypes.POINTER(ctypes.c_float)
@@ -392,7 +392,7 @@ def main():
     print(f"EnNeuro    : {'可用' if HAS_ENEURO else f'不可用 ({ENEURO_ERR})'}")
     print(f"CUDA 算子库: {LIB_DIR}  (已加载 {len(libs)}/{len(CUDA_SIGS)})")
     if missing:
-        print(f"  缺失: {', '.join(missing)}  -> 请先运行 code\\cuda\\build.bat")
+        print(f"  缺失: {', '.join(missing)}  -> 请先运行 code\\eneuro\\cuda\\build.bat")
     print()
 
     all_csv = []

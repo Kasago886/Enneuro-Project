@@ -3,7 +3,7 @@ import numpy as np
 import os
 
 # 加载库
-lib_path = './code/cuda/so/libvector_add.so' if os.name != 'nt' else './code/cuda/dll/vector_add.dll'
+lib_path = './code/eneuro/cuda/so/libvector_add.so' if os.name != 'nt' else './code/eneuro/cuda/dll/vector_add.dll'
 lib = ctypes.cdll.LoadLibrary(lib_path)
 
 # 设置函数签名

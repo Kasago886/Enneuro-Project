@@ -2,8 +2,8 @@
 基础 CUDA 算子验证脚本 (对照 numpy 逐个校验)
 
 使用前先编译:
-    Windows :  code\\cuda\\build.bat
-    Linux   :  bash code/cuda/build.sh
+    Windows :  code\eneuro\cuda\build.bat
+    Linux   :  bash code/eneuro/cuda/build.sh
 
 运行:
     python code/tests/test_cu_basic_ops.py
@@ -15,7 +15,7 @@ import sys
 import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LIB_DIR = os.path.join(ROOT, "cuda", "dll" if os.name == "nt" else "so")
+LIB_DIR = os.path.join(ROOT, "eneuro", "cuda", "dll" if os.name == "nt" else "so")
 EXT = "dll" if os.name == "nt" else "so"
 
 FP = ctypes.POINTER(ctypes.c_float)
@@ -27,7 +27,7 @@ def load_lib(name, funcs):
     """按库名加载动态库并设置各导出函数的签名。"""
     path = os.path.join(LIB_DIR, f"{name}.{EXT}")
     if not os.path.exists(path):
-        raise FileNotFoundError(f"未找到 {path}, 请先编译 (code/cuda/build.bat)")
+        raise FileNotFoundError(f"未找到 {path}, 请先编译 (code/eneuro/cuda/build.bat)")
     lib = ctypes.CDLL(path)
     for fname, (argtypes, restype) in funcs.items():
         fn = getattr(lib, fname)
@@ -134,7 +134,7 @@ def main():
     if failed:
         print("失败算子: " + ", ".join(failed))
         return 1
-    print("全部通过 ✅")
+    print("全部通过")
     return 0
 
 
