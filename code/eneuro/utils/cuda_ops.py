@@ -8,7 +8,7 @@
 
 `dev` 版的前置条件（由 `device_ptr` 统一校验，不满足就抛错而不是静默算错）：
 
-    · 必须是 cupy.ndarray（或 device='cuda' 的 eneuro Tensor）
+    · 必须是 DeviceBuffer（方案A）或 cupy.ndarray / device='cuda' 的 Tensor（方案B）
     · dtype 必须是 float32        —— kernel 只按 float 解释内存
     · 必须 C 连续                 —— 非连续时 .ptr 只指向第一段
     · 必须在当前设备上            —— 与 nvcc 共用 primary context 的硬前提
@@ -34,6 +34,8 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
 import numpy as np
+
+from eneuro.utils.dev_memory import DeviceBuffer
 
 try:
     import cupy as cp
@@ -145,9 +147,19 @@ def np_ptr(arr: Optional[np.ndarray]):
 
 
 def device_ptr(x: Any):
-    """设备指针，并校验 dev 版的三项前置条件。接受 cupy.ndarray 或 eneuro Tensor。"""
+    """取设备指针，并校验前置条件。
+
+    接受三种输入：
+      · `DeviceBuffer`（方案A：自管理显存，句柄已做所有权/设备校验）
+      · `cupy.ndarray`（方案B：零拷贝复用 cupy 显存）
+      · `eneuro.base.Tensor`（device='cuda'，内部还是 cupy.ndarray）
+    """
+    # 方案A：句柄的 ptr 属性自带「已释放」检测，取指针是 O(1)，不流出裸指针
+    if isinstance(x, DeviceBuffer):
+        return VP(x.ptr)
+
     if cp is None:                                      # pragma: no cover
-        raise RuntimeError("需要 cupy 才能使用设备指针接口")
+        raise RuntimeError("需要 cupy 才能使用方案B 的设备指针接口")
 
     from eneuro.base import Tensor as EneTensor
 
