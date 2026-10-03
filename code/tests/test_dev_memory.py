@@ -314,12 +314,20 @@ def test_stats_and_leak(mem: DeviceAllocator) -> None:
           f"{before['free_calls']} -> {after['free_calls']}")
     check("无残留块", after["live_blocks"] == 0, f"live_blocks={after['live_blocks']}")
 
-    # C 侧计数是**进程级**的（统计「一共调了几次 cudaMalloc」），
-    # 所以只能比增量：Python 的 10 次 alloc 必须恰好对应 10 次 cudaMalloc。
+    # 阶段2 起分配器默认启用内存池：10 次 alloc/release 会被池复用，
+    # 所以「alloc 与 cudaMalloc 一一对应」这条断言要用 pool=False 的分配器验证。
     if "native_alloc_calls" in after:
-        check("每次 alloc 恰好一次 cudaMalloc",
-              after["native_alloc_calls"] - before["native_alloc_calls"] == 10,
-              f"dC={after['native_alloc_calls'] - before['native_alloc_calls']}")
+        d_native = after["native_alloc_calls"] - before["native_alloc_calls"]
+        check("池复用后 cudaMalloc 增量远小于 10", d_native < 10,
+              f"dC={d_native}（命中 {after['pool_hits']} 次）")
+
+    with DeviceAllocator(name="no-pool", pool=False) as raw:
+        c0 = raw.stats()["native_alloc_calls"]
+        for _ in range(10):
+            with raw.alloc(1024, name="cycle"):
+                pass
+        d_raw = raw.stats()["native_alloc_calls"] - c0
+        check("pool=False: 10 次 alloc = 10 次 cudaMalloc", d_raw == 10, f"dC={d_raw}")
 
     check("泄漏报告为空", "无未释放块" in mem.leak_report(), mem.leak_report()[:40])
 
