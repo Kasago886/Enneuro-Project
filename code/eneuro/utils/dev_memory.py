@@ -141,6 +141,15 @@ def _raise_for(code: int, message: str) -> None:
     raise exc(f"{message} (code={code})", code=code)
 
 
+def stream_ptr(stream: Optional[int]) -> int:
+    """流句柄规范化：None / 0 -> 0（默认流）
+
+    注意：这里的流是 CUDA 裸指针（int）。若要与 cupy 的流互操作，
+    传 `cp.cuda.get_current_stream().ptr` 即可，两者是同一个东西。
+    """
+    return int(stream) if stream else 0
+
+
 # ---------------------------------------------------------------------------
 # ctypes 封装
 # ---------------------------------------------------------------------------
@@ -173,10 +182,36 @@ class _Lib:
         self.dll.ene_mem_sync.argtypes = [ctypes.c_void_p]
         self.dll.ene_mem_sync.restype = ctypes.c_int
         for name in ("ene_mem_alloc_calls", "ene_mem_free_calls",
-                     "ene_mem_upload_bytes", "ene_mem_download_bytes"):
+                     "ene_mem_upload_bytes", "ene_mem_download_bytes",
+                     "ene_mem_host_alloc_calls"):
             fn = getattr(self.dll, name)
             fn.argtypes = []
             fn.restype = ctypes.c_ulonglong
+
+        # ---- 阶段3：流 / 事件 / pinned 主机内存 / 异步传输 ----
+        for name in ("ene_mem_stream_create", "ene_mem_event_create",
+                     "ene_mem_event_create_timed", "ene_mem_host_alloc"):
+            fn = getattr(self.dll, name)
+            fn.argtypes = [] if name.startswith("ene_mem_stream") or "event_create" in name \
+                else [ctypes.c_size_t]
+            fn.restype = ctypes.c_void_p
+        for name in ("ene_mem_stream_destroy", "ene_mem_event_destroy",
+                     "ene_mem_event_sync", "ene_mem_event_done", "ene_mem_host_free"):
+            fn = getattr(self.dll, name)
+            fn.argtypes = [ctypes.c_void_p]
+            fn.restype = ctypes.c_int
+        for name in ("ene_mem_event_record", "ene_mem_event_wait"):
+            fn = getattr(self.dll, name)
+            fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            fn.restype = ctypes.c_int
+        self.dll.ene_mem_event_elapsed.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self.dll.ene_mem_event_elapsed.restype = ctypes.c_float
+        self.dll.ene_mem_is_pinned.argtypes = [ctypes.c_void_p]
+        self.dll.ene_mem_is_pinned.restype = ctypes.c_int
+        for name in ("ene_mem_upload_async", "ene_mem_download_async"):
+            fn = getattr(self.dll, name)
+            fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+            fn.restype = ctypes.c_int
 
     # 统一的「取错误信息并抛异常」helper
     def _check(self, code: int, what: str) -> None:
@@ -239,6 +274,60 @@ class _BlockInfo:
         return (f"#{self.tag:<4} {self.name:<12} ptr=0x{self.ptr:012x} "
                 f"请求 {self.nbytes:>9} B / 实占 {self.capacity:>9} B "
                 f"({self.size} × {self.dtype}) {where} {bucket}")
+
+
+# ---------------------------------------------------------------------------
+# 锁页（pinned）主机内存（阶段3）
+# ---------------------------------------------------------------------------
+class PinnedBuffer:
+    """一块锁页（pinned）主机内存
+
+    `.array` 是它上面的 numpy 视图（**零拷贝**）：可以先把数据算到这里，
+    再交给 `upload_async` 做真正的异步 DMA；也可以作为 `download_async` 的目标。
+    """
+
+    __slots__ = ("_alloc", "_ptr", "nbytes", "dtype", "name", "array", "released",
+                 "_backing")
+
+    def __init__(self, alloc: "DeviceAllocator", ptr: int, nbytes: int,
+                 dtype: Any, name: str, backing: Any = None):
+        self._alloc = alloc
+        self._ptr = ptr
+        self.nbytes = nbytes
+        self.dtype = np.dtype(dtype)
+        self.name = name
+        self.released = False
+        self._backing = backing                      # 主机回退时保活 ctypes 数组
+        # 用 ctypes 数组拿缓冲协议，再 zero-copy 地 view 成目标 dtype
+        raw = (ctypes.c_char * nbytes).from_address(ptr)
+        self.array = np.frombuffer(raw, dtype=np.uint8, count=nbytes).view(self.dtype)
+
+    @property
+    def ptr(self) -> int:
+        if self.released:
+            raise BufferReleasedError(f"pinned 块 {self.name!r} 已归还，不能再使用")
+        return self._ptr
+
+    def release(self) -> None:
+        """归还到 pinned 池（重复调用会报错）"""
+        self._alloc._pinned_release(self, quiet=False)
+
+    def __enter__(self) -> "PinnedBuffer":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self._alloc._pinned_release(self, quiet=True)
+        return False
+
+    def __del__(self) -> None:                           # pragma: no cover
+        try:
+            self._alloc._pinned_release(self, quiet=True)
+        except Exception:
+            pass
+
+    def __repr__(self) -> str:
+        state = "released" if self.released else "live"
+        return f"<PinnedBuffer {self.name!r} {self.nbytes}B {state}>"
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +409,26 @@ class DeviceBuffer:
         self.download(out, stream=stream)
         return out
 
+    # ---- 异步传输（阶段3，只入队不等待）----
+    def upload_async(self, src: np.ndarray, *, stream: Optional[int] = None) -> "DeviceBuffer":
+        """异步 H2D：只入队，**不等完成**
+
+        `src` 不是锁页内存时，会先拷进内部 pinned staging（主机内 memcpy）再异步发出；
+        staging 登记为「在飞」，要到 `allocator.sync()` 或池回收时才复用。
+        使用数据前必须 sync（或依赖同一流上的后续操作）。
+        """
+        self._alloc._upload_async(self._info, src, stream)
+        return self
+
+    def download_async(self, dst: np.ndarray, *, stream: Optional[int] = None) -> np.ndarray:
+        """异步 D2H：只入队，不等完成
+
+        目标**必须是锁页内存**（用 `allocator.pinned(...)` 的 `.array`）。
+        往 pageable 内存做异步 D2H 实际上并不会异步，这里直接报错而不是骗你。
+        """
+        self._alloc._download_async(self._info, dst, stream)
+        return dst
+
     # ---- 生命周期 ----
     def release(self) -> None:
         """显式归还。重复调用会报错（FR-4.4 双重释放检测）。"""
@@ -366,12 +475,14 @@ class DeviceAllocator:
     def __init__(self, device: int = 0, *, lib_dir: Optional[Path | str] = None,
                  force_host: bool = False, name: str = "allocator",
                  pool: bool = True, pool_max_block: Optional[int] = None,
-                 pool_max_bytes: Optional[int] = None):
+                 pool_max_bytes: Optional[int] = None,
+                 chunk_bytes: int = 16 << 20):
         """
         Args:
             pool: 是否启用内存池；False 时退化为阶段1 的直通分配（每次 cudaMalloc）
             pool_max_block: 超过此容量的块不进池（None = 不限；传 1<<20 即设计文档原行为）
             pool_max_bytes: 池中空闲内存总量上限，超出按 FIFO 驱逐最旧的（None = 不限）
+            chunk_bytes: 单次传输最大字节数，超过则自动分片（FR-3.3）
         """
         global _ATEXIT_REGISTERED
 
@@ -391,6 +502,14 @@ class DeviceAllocator:
         self._free_bytes = 0
         self._free_seq = 0
 
+        # ---- pinned staging 池（阶段3）----
+        self._chunk_bytes = int(chunk_bytes)
+        # nbytes -> [(ptr, nbytes, backing)]；存原始元组而不是 PinnedBuffer 对象，
+        # 这样每次取出都是全新的句柄，旧句柄永远不会「复活」（与 DeviceBuffer 同理）
+        self._pinned_free: dict[int, list[tuple[int, int, Any]]] = {}
+        self._pinned_inflight: list[tuple[PinnedBuffer, int, int]] = []   # (buf, stream, event)
+        self._pinned_bytes = 0
+
         # 本地统计（统一主机/设备两种模式；C 侧计数另有一份用于交叉验证）
         self._stat_allocs = 0
         self._stat_frees = 0
@@ -401,6 +520,10 @@ class DeviceAllocator:
         self._stat_recycled = 0
         self._stat_evicted = 0
         self._stat_trimmed = 0
+        self._stat_pinned_allocs = 0
+        self._stat_pinned_hits = 0
+        self._stat_async_up = 0
+        self._stat_async_down = 0
 
         self._lib: Optional[_Lib] = None
         self._host_mode = True
@@ -561,12 +684,247 @@ class DeviceAllocator:
         self._stat_down_bytes += arr.nbytes
 
     def sync(self, stream: Optional[int] = None) -> None:
-        """等待流上所有工作完成（阶段1 的传输本身已同步，这里供 kernel 之后使用）"""
+        """等待该流上所有工作完成，并回收已完成的 pinned staging（阶段3）
+
+        阶段1/2 的 `upload`/`download` 自带同步，不需要调用；阶段3 的
+        `upload_async`/`download_async` 之后**必须** sync 或依赖同流依赖。
+        """
         if self._host_mode:
             return
         assert self._lib is not None
         code = int(self._lib.dll.ene_mem_sync(ctypes.c_void_p(stream or 0)))
         self._lib._check(code, "sync")
+        self._sweep_pinned(force_stream=stream_ptr(stream))
+
+    # ---- 流与事件（阶段3）----
+    def new_stream(self) -> int:
+        """新建一条**非阻塞**流（返回裸指针）。用完请 destroy_stream。"""
+        self._ensure_open()
+        if self._host_mode:
+            return 0
+        assert self._lib is not None
+        ptr = self._lib.dll.ene_mem_stream_create()
+        if not ptr:
+            code, msg = self._lib.last_error()
+            _raise_for(code, f"创建流失败: {msg}")
+        return int(ptr)
+
+    def destroy_stream(self, stream: int) -> None:
+        if self._host_mode or not stream:
+            return
+        assert self._lib is not None
+        self._lib._check(int(self._lib.dll.ene_mem_stream_destroy(ctypes.c_void_p(stream))),
+                         "destroy_stream")
+
+    def create_event(self, *, timed: bool = False) -> int:
+        """新建事件（默认关闭计时，更快）。用完请 destroy_event。"""
+        if self._lib is None:
+            raise DevMemError("主机回退模式下没有 CUDA 事件")
+        fn = self._lib.dll.ene_mem_event_create_timed if timed else self._lib.dll.ene_mem_event_create
+        ev = fn()
+        if not ev:
+            code, msg = self._lib.last_error()
+            _raise_for(code, f"创建事件失败: {msg}")
+        return int(ev)
+
+    def record_event_on(self, event: int, stream: Optional[int] = None) -> None:
+        assert self._lib is not None
+        self._lib._check(int(self._lib.dll.ene_mem_event_record(
+            ctypes.c_void_p(event), ctypes.c_void_p(stream or 0))), "record_event")
+
+    def wait_event(self, event: int, stream: Optional[int] = None) -> None:
+        """让 stream 上**后续**的工作都等该事件触发"""
+        assert self._lib is not None
+        self._lib._check(int(self._lib.dll.ene_mem_event_wait(
+            ctypes.c_void_p(event), ctypes.c_void_p(stream or 0))), "wait_event")
+
+    def event_sync(self, event: int) -> None:
+        """主机阻塞等该事件"""
+        assert self._lib is not None
+        self._lib._check(int(self._lib.dll.ene_mem_event_sync(ctypes.c_void_p(event))),
+                         "event_sync")
+
+    def event_done(self, event: int) -> bool:
+        """非阻塞查询事件是否已完成"""
+        assert self._lib is not None
+        return bool(self._lib.dll.ene_mem_event_done(ctypes.c_void_p(event)))
+
+    def destroy_event(self, event: int) -> None:
+        if self._lib is None or not event:
+            return
+        self._lib.dll.ene_mem_event_destroy(ctypes.c_void_p(event))
+
+    def event_elapsed(self, start: int, end: int) -> float:
+        """两个**计时事件**之间的 GPU 侧毫秒数（需用 create_event(timed=True) 创建）"""
+        assert self._lib is not None
+        return float(self._lib.dll.ene_mem_event_elapsed(
+            ctypes.c_void_p(start), ctypes.c_void_p(end)))
+
+    # ---- pinned 主机内存（阶段3）----
+    def pinned(self, size: int, *, dtype: Any = np.float32,
+               name: str = "pinned") -> PinnedBuffer:
+        """取一块锁页主机内存（按精确字节数池化复用，FR-3.2）
+
+        `buf.array` 是它的 numpy 视图，可直接填数/读数，零拷贝。
+        """
+        self._ensure_open()
+        if not isinstance(size, (int, np.integer)) or size <= 0:
+            raise InvalidArgumentError(f"size 必须是正整数，得到 {size!r}")
+        return self._pinned_acquire(int(size) * np.dtype(dtype).itemsize,
+                                    np.dtype(dtype), name)
+
+    def _pinned_acquire(self, nbytes: int, dtype: Any = np.uint8,
+                        name: str = "pinned") -> PinnedBuffer:
+        def take() -> Optional[PinnedBuffer]:
+            bucket = self._pinned_free.get(nbytes)
+            if not bucket:
+                return None
+            self._stat_pinned_hits += 1
+            ptr, nb, backing = bucket.pop()
+            if not bucket:
+                del self._pinned_free[nbytes]
+            return PinnedBuffer(self, ptr, nb, dtype, name, backing=backing)
+
+        hit = take()
+        if hit is not None:
+            return hit
+
+        # 池里没有 → 先扫一遍「在飞」的，可能已有完成的了（这样 pinned 用量自然有界）
+        self._sweep_pinned()
+        hit = take()
+        if hit is not None:
+            return hit
+
+        if self._host_mode:
+            raw = (ctypes.c_char * nbytes)()             # 主机模式：普通内存即可
+            return PinnedBuffer(self, ctypes.addressof(raw), nbytes, dtype, name, backing=raw)
+
+        assert self._lib is not None
+        ptr = self._lib.dll.ene_mem_host_alloc(ctypes.c_size_t(nbytes))
+        if not ptr:
+            code, msg = self._lib.last_error()
+            _raise_for(code, f"分配 {nbytes} 字节锁页内存失败: {msg}")
+        self._pinned_bytes += nbytes
+        self._stat_pinned_allocs += 1
+        return PinnedBuffer(self, int(ptr), nbytes, dtype, name)
+
+    def _pinned_release(self, buf: PinnedBuffer, *, quiet: bool) -> None:
+        if buf.released:
+            if quiet:
+                return
+            raise BufferReleasedError(f"pinned 块 {buf.name!r} 已归还 —— 重复归还")
+        buf.released = True
+        entry = (buf._ptr, buf.nbytes, buf._backing)
+        buf._backing = None
+        with self._lock:
+            if self._closed:
+                drop = True
+            else:
+                self._pinned_free.setdefault(buf.nbytes, []).append(entry)
+                drop = False
+        if drop:
+            self._free_pinned_native(*entry)
+
+    def _free_pinned_native(self, ptr: int, nbytes: int, backing: Any) -> None:
+        self._pinned_bytes -= nbytes
+        if backing is not None:
+            return                                       # 主机回退：交回 GC
+        if self._lib is not None:
+            self._lib.dll.ene_mem_host_free(ctypes.c_void_p(ptr))
+
+    def _sweep_pinned(self, force_stream: Optional[int] = None) -> int:
+        """回收已完成的在飞 pinned 缓冲；force_stream 指定时无条件回收该流的"""
+        if not self._pinned_inflight or self._lib is None:
+            return 0
+        remaining = []
+        freed = 0
+        for buf, sid, ev in self._pinned_inflight:
+            if force_stream is not None:
+                done = (sid == force_stream)
+            else:
+                done = self.event_done(ev)
+            if done:
+                self.destroy_event(ev)
+                self._pinned_release(buf, quiet=True)
+                freed += 1
+            else:
+                remaining.append((buf, sid, ev))
+        self._pinned_inflight = remaining
+        return freed
+
+    # ---- 异步传输（阶段3）----
+    def _issue_copy(self, dst_ptr: int, src_ptr: int, nbytes: int,
+                    stream: Optional[int], *, up: bool) -> None:
+        """分片下发拷贝（FR-3.3）：单次不超过 chunk_bytes"""
+        assert self._lib is not None
+        s = ctypes.c_void_p(stream or 0)
+        fn = self._lib.dll.ene_mem_upload_async if up else self._lib.dll.ene_mem_download_async
+        what = "upload_async" if up else "download_async"
+        off = 0
+        while off < nbytes:
+            n = min(self._chunk_bytes, nbytes - off)
+            code = int(fn(ctypes.c_void_p(dst_ptr + off), ctypes.c_void_p(src_ptr + off),
+                          ctypes.c_size_t(n), s))
+            self._lib._check(code, f"{what} {n} 字节")
+            off += n
+
+    def _upload_async(self, info: _BlockInfo, src: np.ndarray,
+                      stream: Optional[int]) -> None:
+        self._ensure_open()
+        self._ensure_live(info, "upload_async")
+        arr = _check_host_array(src, info, "upload_async")
+        nbytes = arr.nbytes
+
+        if self._host_mode:
+            ctypes.memmove(info.ptr, arr.ctypes.data, nbytes)
+            self._stat_up_bytes += nbytes
+            return
+
+        assert self._lib is not None
+        host_ptr = int(arr.ctypes.data)
+        sid = stream_ptr(stream)
+        if self._lib.dll.ene_mem_is_pinned(ctypes.c_void_p(host_ptr)):
+            self._issue_copy(info.ptr, host_ptr, nbytes, stream, up=True)
+        else:
+            # pageable 源 -> 先落到 pinned staging（主机内 memcpy，约 10 GB/s），再异步 H2D
+            pin = self._pinned_acquire(nbytes, np.uint8, "staging")
+            ctypes.memmove(pin._ptr, host_ptr, nbytes)
+            self._issue_copy(info.ptr, pin._ptr, nbytes, stream, up=True)
+            ev = self.create_event()
+            self.record_event_on(ev, stream)             # 记在 copy 流上
+            self._pinned_inflight.append((pin, sid, ev))
+        self._stat_up_bytes += nbytes
+        self._stat_async_up += 1
+
+    def _download_async(self, info: _BlockInfo, dst: np.ndarray,
+                        stream: Optional[int]) -> None:
+        self._ensure_open()
+        self._ensure_live(info, "download_async")
+        arr = _check_host_array(dst, info, "download_async")
+
+        if self._host_mode:
+            ctypes.memmove(arr.ctypes.data, info.ptr, arr.nbytes)
+            self._stat_down_bytes += arr.nbytes
+            return
+
+        assert self._lib is not None
+        dst_ptr = int(arr.ctypes.data)
+        if not self._lib.dll.ene_mem_is_pinned(ctypes.c_void_p(dst_ptr)):
+            raise InvalidArgumentError(
+                "download_async 需要锁页（pinned）目标：请用 allocator.pinned(n) 拿 `.array`，"
+                "或改用同步的 download()")
+        self._issue_copy(dst_ptr, info.ptr, arr.nbytes, stream, up=False)
+        self._stat_down_bytes += arr.nbytes
+        self._stat_async_down += 1
+
+    # ---- 双缓冲流水线（阶段3）----
+    def double_buffer(self, size: int, *, dtype: Any = np.float32,
+                      slots: int = 2, name: str = "pipe") -> "DoubleBuffer":
+        """创建双缓冲流水线（FR-3.4）"""
+        self._ensure_open()
+        if self._host_mode:
+            raise DevMemError("主机回退模式不支持双缓冲流水线（需要 CUDA 流与事件）")
+        return DoubleBuffer(self, size, dtype=dtype, slots=slots, name=name)
 
     # ---- 生命周期 ----
     def _release(self, info: _BlockInfo, *, quiet: bool) -> None:
@@ -666,19 +1024,36 @@ class DeviceAllocator:
             return [b for bucket in self._free.values() for b in bucket]
 
     def close(self) -> None:
-        """释放本分配器名下所有显存（活跃块 + 池中空闲块），幂等"""
+        """释放本分配器名下所有设备显存与锁页内存，幂等
+
+        会先把已知的流同步完，避免释放正在被 kernel 使用的显存。
+        """
+        if not self._host_mode and self._lib is not None:
+            for sid in {sid for _, sid, _ in self._pinned_inflight}:
+                self._lib.dll.ene_mem_sync(ctypes.c_void_p(sid))
+            self._lib.dll.ene_mem_sync(ctypes.c_void_p(0))
+
         with self._lock:
             if self._closed:
                 return
             self._closed = True                       # 先置位：_release 便不再回池
             pending = list(self._blocks.values())
             pooled = [b for bucket in self._free.values() for b in bucket]
+            pinned = [t for bucket in self._pinned_free.values() for t in bucket]
+            inflight = [(b._ptr, b.nbytes, b._backing) for b, _, _ in self._pinned_inflight]
+            events = [ev for _, _, ev in self._pinned_inflight]
             self._free.clear()
             self._free_bytes = 0
+            self._pinned_free.clear()
+            self._pinned_inflight = []
         for info in pending:
             self._release(info, quiet=True)           # 走正常回收路径（已关闭 → 直接 free）
         for info in pooled:
             self._free_native(info, quiet=True)
+        for ev in events:
+            self.destroy_event(ev)
+        for entry in pinned + inflight:
+            self._free_pinned_native(*entry)
         _LIVE_ALLOCATORS.discard(self)
 
     def leak_report(self) -> str:
@@ -709,6 +1084,8 @@ class DeviceAllocator:
                        for k, v in sorted(self._free.items()) if v}
             hits, misses = self._stat_pool_hits, self._stat_pool_misses
             evicted, trimmed = self._stat_evicted, self._stat_trimmed
+            pinned_free = sum(len(v) for v in self._pinned_free.values())
+            pinned_inflight = len(self._pinned_inflight)
 
         requests = hits + misses
         out: dict[str, Any] = {
@@ -735,6 +1112,14 @@ class DeviceAllocator:
             "evicted_blocks": evicted,
             "trimmed_blocks": trimmed,
             "free_classes": classes,
+            # ---- pinned staging / 异步（阶段3）----
+            "pinned_allocs": self._stat_pinned_allocs,
+            "pinned_hits": self._stat_pinned_hits,
+            "pinned_free_blocks": pinned_free,
+            "pinned_inflight": pinned_inflight,
+            "pinned_bytes": self._pinned_bytes,
+            "async_upload_calls": self._stat_async_up,
+            "async_download_calls": self._stat_async_down,
         }
         if self._lib is not None:
             # C 侧计数：用于交叉验证「热路径真的没再 cudaMalloc」（NFR-3）
@@ -742,6 +1127,7 @@ class DeviceAllocator:
             out["native_free_calls"] = int(self._lib.dll.ene_mem_free_calls())
             out["native_upload_bytes"] = int(self._lib.dll.ene_mem_upload_bytes())
             out["native_download_bytes"] = int(self._lib.dll.ene_mem_download_bytes())
+            out["native_host_alloc_calls"] = int(self._lib.dll.ene_mem_host_alloc_calls())
         return out
 
     # ---- 内部校验 ----
@@ -767,6 +1153,118 @@ class DeviceAllocator:
             self.close()
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# 双缓冲流水线（阶段3）
+# ---------------------------------------------------------------------------
+class _PipelineSlot:
+    """双缓冲流水线的一个槽"""
+
+    __slots__ = ("_pipe", "index", "buffer", "copy_stream", "compute_stream",
+                 "_ev_copy", "_ev_compute", "_used")
+
+    def __init__(self, pipe: "DoubleBuffer", index: int, buffer: DeviceBuffer,
+                 ev_copy: int, ev_compute: int):
+        self._pipe = pipe
+        self.index = index
+        self.buffer = buffer
+        self.copy_stream = pipe.copy_stream
+        self.compute_stream = pipe.compute_stream
+        self._ev_copy = ev_copy
+        self._ev_compute = ev_compute
+        self._used = False
+
+    def upload_async(self, src: np.ndarray) -> "_PipelineSlot":
+        """异步把 src 传进本槽，并保证本槽 compute_stream 上后续工作等它完成"""
+        mem = self._pipe._alloc
+        if self._used:
+            # 复用本槽前，先等上一轮在本槽上的计算跑完，否则会覆写正在算的数据
+            mem.wait_event(self._ev_compute, self.copy_stream)
+        self.buffer.upload_async(src, stream=self.copy_stream)
+        mem.record_event_on(self._ev_copy, self.copy_stream)
+        mem.wait_event(self._ev_copy, self.compute_stream)
+        self._used = True
+        return self
+
+    def done(self) -> None:
+        """声明本槽本轮的计算已全部提交（记录事件，供下一轮复用前等待）"""
+        self._pipe._alloc.record_event_on(self._ev_compute, self.compute_stream)
+
+    def __repr__(self) -> str:
+        return f"<Slot #{self.index} {self.buffer.name!r}>"
+
+
+class DoubleBuffer:
+    """双缓冲流水线：让「传第 k+1 块」与「算第 k 块」重叠（FR-3.4）
+
+    两条**非阻塞**流 + 每槽一对事件：
+
+        copy_stream    —— H2D 按序排队
+        compute_stream —— kernel 按序排队
+
+    同步规则（缺一不可）：
+
+    * 在某槽上计算**之前**：让 `compute_stream` 等该槽本轮的 copy 事件；
+    * 复用某槽**之前**：让 `copy_stream` 等该槽上一轮的 compute 事件。
+
+    用法：
+
+        with mem.double_buffer(count, dtype=np.float32, slots=2, name="pipe") as pipe:
+            for chunk in chunks:
+                slot = pipe.next()
+                slot.upload_async(chunk)                    # 异步 H2D 到 slot.buffer
+                ops.dev("add", slot.buffer, db, dout, stream=slot.compute_stream)
+                slot.done()                                 # 提交完成事件
+            pipe.sync()                                     # 等两条流跑完
+    """
+
+    def __init__(self, alloc: DeviceAllocator, size: int, *,
+                 dtype: Any = np.float32, slots: int = 2, name: str = "pipe"):
+        if slots < 2:
+            raise InvalidArgumentError(f"双缓冲至少需要 2 个槽，得到 {slots}")
+        self._alloc = alloc
+        self.copy_stream = alloc.new_stream()
+        self.compute_stream = alloc.new_stream()
+        self._slots = [
+            _PipelineSlot(self, i,
+                          alloc.alloc(size, dtype=dtype, name=f"{name}[{i}]"),
+                          alloc.create_event(), alloc.create_event())
+            for i in range(slots)
+        ]
+        self._cursor = 0
+        self._closed = False
+
+    def next(self) -> _PipelineSlot:
+        """轮转取下ー个槽（调用方需保证不会与仍在使用的槽冲突，槽数 ≥ 2 时自然成立）"""
+        slot = self._slots[self._cursor]
+        self._cursor = (self._cursor + 1) % len(self._slots)
+        return slot
+
+    def sync(self) -> None:
+        """等两条流都完成，并回收 staging"""
+        for sid in (self.copy_stream, self.compute_stream):
+            self._alloc.sync(sid)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.sync()
+        mem = self._alloc
+        for slot in self._slots:
+            mem.destroy_event(slot._ev_copy)
+            mem.destroy_event(slot._ev_compute)
+            slot.buffer.release()
+        mem.destroy_stream(self.copy_stream)
+        mem.destroy_stream(self.compute_stream)
+
+    def __enter__(self) -> "DoubleBuffer":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.close()
+        return False
 
 
 def _check_host_array(arr: Any, info: _BlockInfo, what: str) -> np.ndarray:

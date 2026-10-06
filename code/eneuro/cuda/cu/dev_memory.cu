@@ -45,6 +45,7 @@ static unsigned long long g_alloc_calls = 0;
 static unsigned long long g_free_calls  = 0;
 static unsigned long long g_up_bytes    = 0;
 static unsigned long long g_down_bytes  = 0;
+static unsigned long long g_host_alloc_calls = 0;
 
 static void ene_set_error(int code, const char *msg) {
     g_last_code = code;
@@ -231,6 +232,236 @@ int ene_mem_sync(void *stream) {
     return ENE_OK;
 }
 
+// ===========================================================================
+// 阶段3：异步与流水线
+// ===========================================================================
+
+// ---- 流 -------------------------------------------------------------------
+// 用 cudaStreamNonBlocking：不与 legacy 默认流（0）隐式同步。
+// 若用阻塞式流，它和默认流之间会互相等待，重叠就无从谈起。
+ENE_EXPORT
+void *ene_mem_stream_create(void) {
+    cudaStream_t s = NULL;
+    cudaError_t err = cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+    if (err != cudaSuccess) {
+        ene_set_cuda_error(err);
+        return NULL;
+    }
+    ene_set_error(ENE_OK, "");
+    return (void *)s;
+}
+
+ENE_EXPORT
+int ene_mem_stream_destroy(void *stream) {
+    if (stream == NULL) {
+        ene_set_error(ENE_ERR_INVALID, "stream_destroy(NULL)");
+        return ENE_ERR_INVALID;
+    }
+    cudaError_t err = cudaStreamDestroy((cudaStream_t)stream);
+    if (err != cudaSuccess) {
+        ene_set_cuda_error(err);
+        return g_last_code;
+    }
+    ene_set_error(ENE_OK, "");
+    return ENE_OK;
+}
+
+// ---- 事件（跨流同步；可选用计时版做 GPU 侧测时）----------------------------
+ENE_EXPORT
+void *ene_mem_event_create(void) {
+    cudaEvent_t e = NULL;
+    cudaError_t err = cudaEventCreateWithFlags(&e, cudaEventDisableTiming);
+    if (err != cudaSuccess) {
+        ene_set_cuda_error(err);
+        return NULL;
+    }
+    ene_set_error(ENE_OK, "");
+    return (void *)e;
+}
+
+ENE_EXPORT
+void *ene_mem_event_create_timed(void) {
+    cudaEvent_t e = NULL;
+    cudaError_t err = cudaEventCreateWithFlags(&e, cudaEventDefault);
+    if (err != cudaSuccess) {
+        ene_set_cuda_error(err);
+        return NULL;
+    }
+    ene_set_error(ENE_OK, "");
+    return (void *)e;
+}
+
+ENE_EXPORT
+int ene_mem_event_destroy(void *ev) {
+    if (ev == NULL) {
+        ene_set_error(ENE_ERR_INVALID, "event_destroy(NULL)");
+        return ENE_ERR_INVALID;
+    }
+    cudaError_t err = cudaEventDestroy((cudaEvent_t)ev);
+    if (err != cudaSuccess) {
+        ene_set_cuda_error(err);
+        return g_last_code;
+    }
+    ene_set_error(ENE_OK, "");
+    return ENE_OK;
+}
+
+ENE_EXPORT
+int ene_mem_event_record(void *ev, void *stream) {
+    cudaError_t err = cudaEventRecord((cudaEvent_t)ev, (cudaStream_t)stream);
+    if (err != cudaSuccess) {
+        ene_set_cuda_error(err);
+        return g_last_code;
+    }
+    ene_set_error(ENE_OK, "");
+    return ENE_OK;
+}
+
+// 让 stream 上后续的所有工作都等 event 触发（跨流依赖就靠它）
+ENE_EXPORT
+int ene_mem_event_wait(void *ev, void *stream) {
+    cudaError_t err = cudaStreamWaitEvent((cudaStream_t)stream, (cudaEvent_t)ev, 0);
+    if (err != cudaSuccess) {
+        ene_set_cuda_error(err);
+        return g_last_code;
+    }
+    ene_set_error(ENE_OK, "");
+    return ENE_OK;
+}
+
+ENE_EXPORT
+int ene_mem_event_sync(void *ev) {
+    cudaError_t err = cudaEventSynchronize((cudaEvent_t)ev);
+    if (err != cudaSuccess) {
+        ene_set_cuda_error(err);
+        return g_last_code;
+    }
+    ene_set_error(ENE_OK, "");
+    return ENE_OK;
+}
+
+// 事件是否已完成：1 = 完成，0 = 未完成（含查询出错的保守情形）
+ENE_EXPORT
+int ene_mem_event_done(void *ev) {
+    cudaError_t err = cudaEventQuery((cudaEvent_t)ev);
+    if (err == cudaSuccess) {
+        return 1;
+    }
+    if (err != cudaErrorNotReady) {
+        cudaGetLastError();                          // 清掉错误标志，避免污染后续调用
+    }
+    return 0;
+}
+
+ENE_EXPORT
+float ene_mem_event_elapsed(void *start, void *end) {
+    float ms = 0.0f;
+    cudaError_t err = cudaEventElapsedTime(&ms, (cudaEvent_t)start, (cudaEvent_t)end);
+    if (err != cudaSuccess) {
+        ene_set_cuda_error(err);
+        return -1.0f;
+    }
+    return ms;
+}
+
+// ---- 锁页（pinned）主机内存 ------------------------------------------------
+// cudaHostAlloc 很贵（量级与 cudaMalloc 相当），所以上层必须池化复用（FR-3.2）。
+ENE_EXPORT
+void *ene_mem_host_alloc(size_t bytes) {
+    if (bytes == 0) {
+        ene_set_error(ENE_ERR_INVALID, "host_alloc: bytes must be > 0");
+        return NULL;
+    }
+    void *ptr = NULL;
+    cudaError_t err = cudaHostAlloc(&ptr, bytes, cudaHostAllocDefault);
+    if (err != cudaSuccess) {
+        ene_set_cuda_error(err);                     // 显存/锁页内存不足也是 OOM
+        return NULL;
+    }
+    g_host_alloc_calls++;
+    ene_set_error(ENE_OK, "");
+    return ptr;
+}
+
+ENE_EXPORT
+int ene_mem_host_free(void *ptr) {
+    if (ptr == NULL) {
+        ene_set_error(ENE_ERR_INVALID, "host_free(NULL)");
+        return ENE_ERR_INVALID;
+    }
+    cudaError_t err = cudaFreeHost(ptr);
+    if (err != cudaSuccess) {
+        ene_set_cuda_error(err);
+        return g_last_code;
+    }
+    ene_set_error(ENE_OK, "");
+    return ENE_OK;
+}
+
+// 判断某个主机指针是否锁页：1 = pinned（可真正异步 DMA），0 = pageable
+ENE_EXPORT
+int ene_mem_is_pinned(const void *ptr) {
+    if (ptr == NULL) {
+        return 0;
+    }
+    cudaPointerAttributes attr;
+    if (cudaPointerGetAttributes(&attr, ptr) != cudaSuccess) {
+        cudaGetLastError();
+        return 0;
+    }
+#if CUDART_VERSION >= 11000
+    return (attr.type == cudaMemoryTypeHost) ? 1 : 0;
+#else
+    return (attr.memoryType == cudaMemoryTypeHost) ? 1 : 0;
+#endif
+}
+
+// ---- 异步传输（**不含任何同步**）-------------------------------------------
+// 注意与 ene_mem_upload/download 的区别：
+//   上者 = 纯异步，只入队；调用方必须自己用 stream/event 保证「用之前已完成」
+//   后者 = 同步语义（内部 Async + StreamSynchronize），供非流水线场景直接用
+ENE_EXPORT
+int ene_mem_upload_async(void *d_ptr, const void *h_ptr, size_t bytes, void *stream) {
+    if (d_ptr == NULL || h_ptr == NULL) {
+        ene_set_error(ENE_ERR_INVALID, "upload_async: null pointer");
+        return ENE_ERR_INVALID;
+    }
+    if (bytes == 0) {
+        ene_set_error(ENE_ERR_INVALID, "upload_async: bytes must be > 0");
+        return ENE_ERR_INVALID;
+    }
+    cudaError_t err = cudaMemcpyAsync(d_ptr, h_ptr, bytes, cudaMemcpyHostToDevice,
+                                      (cudaStream_t)stream);
+    if (err != cudaSuccess) {
+        ene_set_cuda_error(err);
+        return g_last_code;
+    }
+    g_up_bytes += (unsigned long long)bytes;
+    ene_set_error(ENE_OK, "");
+    return ENE_OK;
+}
+
+ENE_EXPORT
+int ene_mem_download_async(void *h_ptr, const void *d_ptr, size_t bytes, void *stream) {
+    if (h_ptr == NULL || d_ptr == NULL) {
+        ene_set_error(ENE_ERR_INVALID, "download_async: null pointer");
+        return ENE_ERR_INVALID;
+    }
+    if (bytes == 0) {
+        ene_set_error(ENE_ERR_INVALID, "download_async: bytes must be > 0");
+        return ENE_ERR_INVALID;
+    }
+    cudaError_t err = cudaMemcpyAsync(h_ptr, d_ptr, bytes, cudaMemcpyDeviceToHost,
+                                      (cudaStream_t)stream);
+    if (err != cudaSuccess) {
+        ene_set_cuda_error(err);
+        return g_last_code;
+    }
+    g_down_bytes += (unsigned long long)bytes;
+    ene_set_error(ENE_OK, "");
+    return ENE_OK;
+}
+
 // ---- 统计（供基准脚本验证「稳态零分配」NFR-3）------------------------------
 ENE_EXPORT
 unsigned long long ene_mem_alloc_calls(void) { return g_alloc_calls; }
@@ -245,9 +476,13 @@ ENE_EXPORT
 unsigned long long ene_mem_download_bytes(void) { return g_down_bytes; }
 
 ENE_EXPORT
+unsigned long long ene_mem_host_alloc_calls(void) { return g_host_alloc_calls; }
+
+ENE_EXPORT
 void ene_mem_reset_counters(void) {
     g_alloc_calls = 0;
     g_free_calls  = 0;
     g_up_bytes    = 0;
     g_down_bytes  = 0;
+    g_host_alloc_calls = 0;
 }

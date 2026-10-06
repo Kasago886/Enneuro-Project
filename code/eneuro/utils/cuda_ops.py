@@ -184,11 +184,18 @@ def device_ptr(x: Any):
 
 
 def stream_ptr(stream: Any = None) -> int:
-    """把 cupy stream（或 None -> 当前流）转成裸指针"""
-    if cp is None:                                      # pragma: no cover
-        return 0
+    """把 stream 规范化成裸指针
+
+    · None            -> cupy 可用时取当前流，否则默认流 0
+    · int             -> **原样透传**（方案A 的流就是裸指针，不能丢掉）
+    · cupy Stream 等  -> 取 .ptr
+    """
     if stream is None:
+        if cp is None:
+            return 0
         stream = cp.cuda.get_current_stream()
+    if isinstance(stream, int):
+        return stream
     return int(stream.ptr)
 
 
