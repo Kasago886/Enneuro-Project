@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""方案A 阶段1：自管理设备显存（直通分配，无池）
+"""方案A 自管理设备显存
 
 职责划分（见 `doc/CUDAC/显存管理.md` 第四节 D1/D2）：
 
@@ -9,11 +9,14 @@
 **已实现**：
     阶段1  直通分配、同步传输、句柄与生命周期、错误上报、统计、无 CUDA 回退
     阶段2  size-class 内存池（命中即复用，稳态零 cudaMalloc）、trim、池驱逐、池统计
+    阶段3  pinned staging 池、异步拷贝、流与事件、双缓冲流水线
+    阶段4  `__cuda_array_interface__` / `as_cupy()` 零拷贝互操作、外部视图租约、
+           混合模式（cupy 输入 + 池 workspace）、不依赖 cupy 的 CAI 反向读取
 
-**不含**（后续阶段）：pinned/异步/双缓冲（阶段3）、
-`__cuda_array_interface__` 互操作（阶段4）、多设备池隔离（阶段5）。
+**不含**（后续阶段）：多设备池隔离、跨流复用防护、C 侧计数加锁（阶段5）。
 
-不依赖 cupy（NFR-6），只用到 `ctypes` + `numpy`。
+不依赖 cupy（NFR-6）：`ctypes` + `numpy` 即可跑完整个方案A；
+只有显式调用 `as_cupy()` / `cai_ptr()` 的互操作路径才需要 cupy 或对应的库。
 
 典型用法：
 
@@ -28,6 +31,13 @@
         CudaOps().dev("add", da, db, dout)               # 多次算（复用现有算子）
         dout.download(out_np)                            # 一次出
     # 退出时自动归还；有残留会打印泄漏清单
+
+互操作（阶段4）：
+
+    with mem.alloc(n, name="ws") as d:                   # 池里的 workspace
+        arr = d.as_cupy()                                # 零拷贝 + 登记租约
+        arr[:] = 1.0                                     # cupy 直接写
+        ops.dev("add", cp_a, cp_b, d)                     # cupy 输入 + 池输出 混用
 """
 from __future__ import annotations
 
@@ -37,7 +47,7 @@ import os
 import threading
 import time
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
@@ -117,6 +127,10 @@ class DeviceError(DevMemError):
 
 class BufferReleasedError(DevMemError):
     """使用了已释放的句柄（含双重释放）"""
+
+
+class BufferLeasedError(DevMemError):
+    """块上还有未失效的外部视图（cupy/torch 零拷贝包装），此时释放会造成悬垂（FR-6.2）"""
 
 
 class AllocatorClosedError(DevMemError):
@@ -257,6 +271,10 @@ class _BlockInfo:
     cls: Optional[BucketKey] = None               # size-class 桶 key
     free_seq: int = 0                             # 入池顺序（FIFO 驱逐用）
     free_time: float = 0.0                        # 入池时刻（trim(older_than=) 用）
+    # 外部视图租约（阶段4）：cupy/torch 数组活着期间，本块不允许被池回收（FR-6.2）。
+    # 存 weakref 而不是直接存标记对象 —— 直接存会形成「块→标记→块」的引用环，
+    # 标记永远死不了，租约也就永远不释放。
+    leases: set = field(default_factory=set)
 
     @property
     def size(self) -> int:
@@ -274,6 +292,103 @@ class _BlockInfo:
         return (f"#{self.tag:<4} {self.name:<12} ptr=0x{self.ptr:012x} "
                 f"请求 {self.nbytes:>9} B / 实占 {self.capacity:>9} B "
                 f"({self.size} × {self.dtype}) {where} {bucket}")
+
+
+# ---------------------------------------------------------------------------
+# 外部视图租约（阶段4，FR-6.2）
+#
+# 问题：把本池的块零拷贝交给 cupy 之后，cupy 数组只记得一个裸指针 ——
+# 如果这时块被归还到池里并复用，那个数组就会静默地读到/写错别的张量。
+#
+# 解法：用 cupy 自己保证的引用链做「租约」
+#
+#     cp.ndarray ──► MemoryPointer ──► UnownedMemory ──► owner(=_Lease)
+#
+# `owner` 只是让 `_Lease` 活到数组被回收为止。我们同时在块上登记一个**弱引用 +
+# 回调**：弱引用的目标（`_Lease`）一死，回调就把租约摘掉，最后一个租约消失时
+# 才真正回收那块显存（见 `DeviceAllocator._finish_deferred`）。
+#
+# 用「弱引用 + 回调」而不是 WeakSet：回调是「最后一个视图消失」的唯一下手点。
+# ---------------------------------------------------------------------------
+class _Lease:
+    """零负载的租约标记：唯一职责是「活到外部数组被回收为止」"""
+
+    __slots__ = ("__weakref__",)
+
+
+class _LeaseWatch:
+    """挂在 `weakref.ref` 上的回调：租约死亡 → 摘牌子 → 可能触发真正的回收"""
+
+    __slots__ = ("alloc", "info")
+
+    def __init__(self, alloc: "DeviceAllocator", info: _BlockInfo):
+        self.alloc = alloc
+        self.info = info
+
+    def __call__(self, ref: "weakref.ref") -> None:      # pragma: no cover - 由 GC 触发
+        info = self.info
+        info.leases.discard(ref)
+        if not info.leases:
+            self.alloc._finish_deferred(info)
+
+
+# ---------------------------------------------------------------------------
+# CUDA Array Interface（阶段4，FR-6.1 / FR-6.4）
+# ---------------------------------------------------------------------------
+def cupy_available() -> bool:
+    """cupy 是否可导入（不缓存，便于测试里动态屏蔽/恢复）"""
+    try:
+        import cupy                                        # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def require_cupy(what: str):
+    """拿到 cupy 模块，拿不到就给一条能看懂的错误（NFR-6：核心路径不依赖 cupy）"""
+    try:
+        import cupy
+    except Exception as exc:                               # pragma: no cover
+        raise ImportError(
+            f"{what} 需要 cupy；本模块的核心功能（分配/池/传输/算子）不依赖 cupy，"
+            f"只有这条互操作路径需要") from exc
+    return cupy
+
+
+def cai_ptr(x: Any, *, what: str = "array", require_float32: bool = True) -> tuple[int, int]:
+    """从任何实现了 CUDA Array Interface 的对象取 `(设备指针, 字节数)`
+
+    **不依赖 cupy**：cupy / torch / numba / 第三方实现了该协议的对象都能走这条路
+    （FR-6.1 / FR-6.4）。校验口径与 `cuda_ops.device_ptr` 一致，因为它们对应
+    同一组前置条件：kernel 只按 float32 解释内存，且 `ptr` 必须指向连续段。
+    """
+    cai = getattr(x, "__cuda_array_interface__", None)
+    if cai is None:
+        raise TypeError(f"{what}: 需要实现了 __cuda_array_interface__ 的对象，"
+                        f"得到 {type(x).__name__}")
+    version = int(cai.get("version", 0))
+    if version < 3:
+        raise ValueError(f"{what}: CUDA Array Interface 版本 {version} 过低（需要 ≥ 3）")
+
+    typestr = cai["typestr"]
+    if require_float32 and typestr not in ("<f4", "=f4", "|f4"):
+        raise TypeError(f"{what}: kernel 按 float32 解释内存，实际 typestr = {typestr!r}")
+
+    strides = cai.get("strides")
+    if strides is not None and tuple(strides) != (4,):
+        raise ValueError(f"{what}: 需要 C 连续数组，strides = {strides!r}"
+                         f"（非连续时 ptr 只指向第一段）")
+
+    data = cai["data"]
+    ptr = int(data[0] if isinstance(data, (tuple, list)) else data)
+    if not ptr:
+        raise ValueError(f"{what}: 指针为空")
+
+    shape = cai["shape"]
+    count = 1
+    for dim in shape:
+        count *= int(dim)
+    return ptr, count * np.dtype(typestr).itemsize
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +422,28 @@ class PinnedBuffer:
         if self.released:
             raise BufferReleasedError(f"pinned 块 {self.name!r} 已归还，不能再使用")
         return self._ptr
+
+    @property
+    def __array_interface__(self) -> dict:
+        """让 numpy 零拷贝消费（`np.asarray(pin)` / `np.frombuffer(pin)`）
+
+        与 `.array` 一样**不保活**：numpy 数组活得比本句柄久就会指向已归还的锁页内存。
+        """
+        if self.released:
+            raise BufferReleasedError(f"pinned 块 {self.name!r} 已归还，不能再导出视图")
+        return {
+            "data": (self._ptr, False),
+            "shape": (self.array.size,),
+            "strides": None,
+            "typestr": self.dtype.str,
+            "version": 3,
+        }
+
+    def as_numpy(self) -> np.ndarray:
+        """`.array` 的同义方法（显式一点，便于阅读）"""
+        if self.released:
+            raise BufferReleasedError(f"pinned 块 {self.name!r} 已归还，不能再访问")
+        return self.array
 
     def release(self) -> None:
         """归还到 pinned 池（重复调用会报错）"""
@@ -378,6 +515,11 @@ class DeviceBuffer:
         return self._info.released
 
     @property
+    def leases(self) -> int:
+        """当前活着的外部视图（cupy/torch 零拷贝数组）个数（阶段4，FR-6.2）"""
+        return len(self._info.leases)
+
+    @property
     def ptr(self) -> int:
         """裸设备指针。仅供下发 kernel 使用（FR-5.2，O(1)）。"""
         if self._info.released:
@@ -390,7 +532,8 @@ class DeviceBuffer:
     def __repr__(self) -> str:
         state = "released" if self._info.released else "live"
         cap = "" if self._info.capacity == self._info.nbytes else f" cap={self._info.capacity}B"
-        return f"<DeviceBuffer {self._info.name!r} {self.nbytes}B{cap} {state}>"
+        lease = f" leases={len(self._info.leases)}" if self._info.leases else ""
+        return f"<DeviceBuffer {self._info.name!r} {self.nbytes}B{cap}{lease} {state}>"
 
     # ---- 传输 ----
     def upload(self, src: np.ndarray, *, stream: Optional[int] = None) -> "DeviceBuffer":
@@ -429,10 +572,91 @@ class DeviceBuffer:
         self._alloc._download_async(self._info, dst, stream)
         return dst
 
+    # ---- 生态互操作（阶段4，FR-6）----
+    @property
+    def __cuda_array_interface__(self) -> dict:
+        """把本块暴露成 CUDA Array Interface v3（FR-6.1）
+
+        消费方（`cp.asarray(buf)`、`torch.as_tensor(buf, device='cuda')`、
+        `numba.cuda.as_cuda_array(buf)`）拿到这个字典后零拷贝建数组。
+
+        **这是「瞬时借出」，不登记租约**：字典交给对方那一刻起，我们就不知道
+        对方会把数组留多久。所以
+
+        · 想写出 `cp.asarray(buf)` 这种一次性表达式 —— 用它，够用且零成本；
+        · 想让数组活得比本句柄久 —— 请用 `as_cupy()`，它会登记租约阻止池回收。
+
+        分配器上设 `strict_interop=True` 可以把这个「瞬时借出」直接禁掉，
+        强制所有外部视图都走 `as_cupy()`（长生命周期流水线建议打开）。
+
+        `shape` 取**请求的** `nbytes` 而非 `capacity`：桶取整的富余部分不外泄，
+        外部视图写不进那块空隙。`stream=0` 声明「本块与 legacy 默认流有序」，
+        用自定义流的调用方应改用 `as_cupy(stream=...)`。
+        """
+        info = self._info
+        if info.released:
+            raise BufferReleasedError(
+                f"块 {info.name!r} 已被释放，不能再导出 CUDA Array Interface")
+        if info.device < 0:
+            raise DeviceError(
+                f"块 {info.name!r} 在主机回退模式（无 CUDA），无法导出设备数组接口")
+        if self._alloc._strict_interop:
+            raise BufferLeasedError(
+                f"分配器开启了 strict_interop，拒绝「瞬时借出」块 {info.name!r}；"
+                f"请改用 as_cupy()（会登记租约，可安全长期持有）")
+        return {
+            "shape": (info.size,),
+            "strides": None,
+            "typestr": info.dtype.str,
+            "data": (info.ptr, False),
+            "version": 3,
+            "stream": self._alloc._cai_stream,
+        }
+
+    def as_cupy(self, *, stream: Optional[int] = None) -> Any:
+        """零拷贝包装成 `cupy.ndarray`，**并登记租约**（FR-6.2）
+
+        返回的数组活着的时候本块不会被池回收 —— 哪怕 Python 侧已经把 `DeviceBuffer`
+        删掉了（这时块进入「延迟回收」：句柄立即失效，但显存要等最后一个外部视图
+        死亡才归还池）。数组被 GC 后租约自动解除，无需手动清理。
+
+        `stream` 用来声明「本块的数据与哪个流有序」，会写进数组的流语义里；
+        默认取分配器的 `cai_stream`（0 = legacy 默认流）。
+        """
+        cp = require_cupy("DeviceBuffer.as_cupy()")
+        self._alloc._ensure_open()
+        info = self._info
+        if info.released:
+            raise BufferReleasedError(f"块 {info.name!r} 已被释放，不能再包装")
+        if info.device < 0:
+            raise DeviceError(
+                f"块 {info.name!r} 在主机回退模式（无 CUDA），无法包装成 cupy 数组")
+
+        sid = self._alloc._cai_stream if stream is None else int(stream)
+        lease = _Lease()
+        info.leases.add(weakref.ref(lease, _LeaseWatch(self._alloc, info)))
+        # UnownedMemory 是「别人的内存」：它不会去 free，只负责把 owner 保活 ——
+        # 这正是我们需要的行为，单一所有者原则（D5）仍然由分配器履行。
+        mem = cp.cuda.UnownedMemory(info.ptr, info.nbytes, lease, info.device)
+        memptr = cp.cuda.MemoryPointer(mem, 0)
+        arr = cp.ndarray((info.size,), dtype=info.dtype, memptr=memptr)
+        if sid:
+            # 非默认流：交给 cupy 记录，后续跨流使用时它会插入事件等待
+            try:
+                arr.data.mem._stream = sid                 # type: ignore[attr-defined]
+            except Exception:
+                pass
+        return arr
+
     # ---- 生命周期 ----
-    def release(self) -> None:
-        """显式归还。重复调用会报错（FR-4.4 双重释放检测）。"""
-        self._alloc._release(self._info, quiet=False)
+    def release(self, *, force: bool = False) -> None:
+        """显式归还。重复调用会报错（FR-4.4 双重释放检测）。
+
+        还有外部视图（`as_cupy()` 出来的 cupy 数组）活着时**默认报错而不是照做**：
+        照做会让那些数组指向已被复用的显存，是最难查的一类静默错误（FR-6.2）。
+        `force=True` 表示「我知道那些视图已经不用了」，此时照常归还。
+        """
+        self._alloc._release(self._info, quiet=False, force=force)
 
     def __enter__(self) -> "DeviceBuffer":
         return self
@@ -476,13 +700,18 @@ class DeviceAllocator:
                  force_host: bool = False, name: str = "allocator",
                  pool: bool = True, pool_max_block: Optional[int] = None,
                  pool_max_bytes: Optional[int] = None,
-                 chunk_bytes: int = 16 << 20):
+                 chunk_bytes: int = 16 << 20,
+                 strict_interop: bool = False,
+                 cai_stream: int = 0):
         """
         Args:
             pool: 是否启用内存池；False 时退化为阶段1 的直通分配（每次 cudaMalloc）
             pool_max_block: 超过此容量的块不进池（None = 不限；传 1<<20 即设计文档原行为）
             pool_max_bytes: 池中空闲内存总量上限，超出按 FIFO 驱逐最旧的（None = 不限）
             chunk_bytes: 单次传输最大字节数，超过则自动分片（FR-3.3）
+            strict_interop: True 时禁止 `__cuda_array_interface__` 的「瞬时借出」，
+                所有外部视图必须走 `as_cupy()`（阶段4，FR-6.2）
+            cai_stream: 写进 `__cuda_array_interface__['stream']` 的流（0 = legacy 默认流）
         """
         global _ATEXIT_REGISTERED
 
@@ -493,6 +722,10 @@ class DeviceAllocator:
         self._counter = 0
         self._peak_live_bytes = 0
         self._live_bytes = 0
+        # 阶段4：已「逻辑释放」但还挂着外部视图的块，等租约清零后真正回收
+        self._pending_release: dict[int, _BlockInfo] = {}
+        self._strict_interop = bool(strict_interop)
+        self._cai_stream = int(cai_stream)
 
         # ---- 内存池（阶段2）----
         self._pool = bool(pool)
@@ -524,6 +757,8 @@ class DeviceAllocator:
         self._stat_pinned_hits = 0
         self._stat_async_up = 0
         self._stat_async_down = 0
+        self._stat_deferred = 0                        # 阶段4：进入延迟回收的次数
+        self._stat_lease_blocked = 0                   # 阶段4：因租约未清被拒绝释放的次数
 
         self._lib: Optional[_Lib] = None
         self._host_mode = True
@@ -927,9 +1162,20 @@ class DeviceAllocator:
         return DoubleBuffer(self, size, dtype=dtype, slots=slots, name=name)
 
     # ---- 生命周期 ----
-    def _release(self, info: _BlockInfo, *, quiet: bool) -> None:
-        recycle = False
-        victims: list[_BlockInfo] = []
+    def _release(self, info: _BlockInfo, *, quiet: bool, force: bool = False) -> None:
+        # 阶段4（FR-6.2）：还有外部视图活着时，绝不能把这块显存拿去复用
+        if info.leases and not force:
+            if quiet:
+                # GC / with 退出路径：既然不能报错，也不能造成悬垂，就「延迟回收」
+                self._defer_release(info)
+                return
+            with self._lock:
+                self._stat_lease_blocked += 1
+            raise BufferLeasedError(
+                f"块 {info.name!r}(ptr=0x{info.ptr:x}) 还有 {len(info.leases)} 个"
+                f"外部视图（as_cupy 出来的数组）未失效，现在释放会让它们指向已被复用的显存。"
+                f"请先删除这些数组，或 release(force=True)")
+
         with self._lock:
             if info.released:
                 if quiet:
@@ -938,23 +1184,63 @@ class DeviceAllocator:
                     f"块 {info.name!r}(ptr=0x{info.ptr:x}) 已被释放 —— 双重释放")
             info.released = True
             self._blocks.pop(info.ptr, None)
+            # 按身份删：force 释放后同一地址可能已被别的块占用，不能按 ptr 盲弹
+            if self._pending_release.get(info.ptr) is info:
+                del self._pending_release[info.ptr]
             self._stat_frees += 1
             self._live_bytes -= info.nbytes
+        self._pool_or_free(info)
 
-            # FR-2.1：可池化的块留在池里等复用，不归还驱动
-            if info.cls is not None and not self._closed:
+    def _pool_or_free(self, info: _BlockInfo) -> None:
+        """把「已经逻辑释放」的块放回池里等复用，或直接归还驱动（FR-2.1）
+
+        `_release` 与 `_finish_deferred` 共用；**不得在持锁时**调 `_free_native`（FR-11.2）。
+        """
+        victims: list[_BlockInfo] = []
+        with self._lock:
+            recycle = info.cls is not None and not self._closed
+            if recycle:
                 self._free_seq += 1
                 info.free_seq = self._free_seq
                 info.free_time = time.monotonic()
                 self._free.setdefault(info.cls, []).append(info)
                 self._free_bytes += info.capacity
                 self._stat_recycled += 1
-                recycle = True
                 victims = self._evict_locked()        # FR-2.6：超上限则驱逐最旧的
         if not recycle:
-            self._free_native(info, quiet=quiet)
+            self._free_native(info, quiet=True)
         for victim in victims:
             self._free_native(victim, quiet=True)
+
+    def _defer_release(self, info: _BlockInfo) -> None:
+        """逻辑释放但暂不回收：等最后一个外部视图死亡（阶段4，FR-6.2）
+
+        句柄立即失效（`released=True`），块从块表里摘出，但显存不还池也不还驱动。
+        因为显存还没归还，同一地址不可能被再次分配出去，所以 `_pending_release`
+        按 ptr 索引是安全的。
+        """
+        with self._lock:
+            if info.ptr in self._pending_release:
+                return
+            if not info.released:
+                info.released = True
+                self._blocks.pop(info.ptr, None)
+                self._stat_frees += 1
+                self._stat_deferred += 1
+                self._live_bytes -= info.nbytes
+            self._pending_release[info.ptr] = info
+
+    def _finish_deferred(self, info: _BlockInfo) -> None:
+        """最后一个外部视图死亡时被 GC 回调触发（阶段4，FR-6.2）"""
+        if info.leases:                                   # 还有别的视图，再等等
+            return
+        with self._lock:
+            # 身份校验：本块可能早就被 force 释放、地址又被新块占用
+            # （新块同样可能在延迟表中），按 ptr 盲弹会错杀
+            if self._pending_release.get(info.ptr) is not info:
+                return
+            del self._pending_release[info.ptr]
+        self._pool_or_free(info)
 
     def _free_native(self, info: _BlockInfo, *, quiet: bool) -> None:
         """真正归还给驱动/GC。**不得在持锁时调用**（FR-11.2：cudaFree 会阻塞）"""
@@ -1023,10 +1309,19 @@ class DeviceAllocator:
         with self._lock:
             return [b for bucket in self._free.values() for b in bucket]
 
+    @property
+    def deferred_blocks(self) -> list[_BlockInfo]:
+        """已逻辑释放、但仍被外部视图（cupy/torch）引用而未回收的块（阶段4）"""
+        with self._lock:
+            return list(self._pending_release.values())
+
     def close(self) -> None:
         """释放本分配器名下所有设备显存与锁页内存，幂等
 
         会先把已知的流同步完，避免释放正在被 kernel 使用的显存。
+        注意：**关闭时不再等待外部视图**（`close()` 就是「我彻底不用了」的声明），
+        因此若还有 `as_cupy()` 出来的数组活着，关闭后它们即成为悬垂 —— 这种情况
+        会打一行警告，而不是静默踩坑。
         """
         if not self._host_mode and self._lib is not None:
             for sid in {sid for _, sid, _ in self._pinned_inflight}:
@@ -1039,16 +1334,22 @@ class DeviceAllocator:
             self._closed = True                       # 先置位：_release 便不再回池
             pending = list(self._blocks.values())
             pooled = [b for bucket in self._free.values() for b in bucket]
+            deferred = list(self._pending_release.values())
             pinned = [t for bucket in self._pinned_free.values() for t in bucket]
             inflight = [(b._ptr, b.nbytes, b._backing) for b, _, _ in self._pinned_inflight]
             events = [ev for _, _, ev in self._pinned_inflight]
             self._free.clear()
             self._free_bytes = 0
+            self._pending_release.clear()
             self._pinned_free.clear()
             self._pinned_inflight = []
+        stray = sum(len(b.leases) for b in deferred)
+        if stray:
+            print(f"[dev_memory / {self.name}] 警告: close() 时有 {stray} 个外部视图仍活着，"
+                  f"它们引用的显存已归还驱动，继续使用会读写到别人的数据")
         for info in pending:
             self._release(info, quiet=True)           # 走正常回收路径（已关闭 → 直接 free）
-        for info in pooled:
+        for info in pooled + deferred:
             self._free_native(info, quiet=True)
         for ev in events:
             self.destroy_event(ev)
@@ -1058,6 +1359,7 @@ class DeviceAllocator:
 
     def leak_report(self) -> str:
         live = self.live_blocks
+        deferred = self.deferred_blocks
         with self._lock:
             free_blocks = sum(len(b) for b in self._free.values())
             free_bytes = self._free_bytes
@@ -1068,6 +1370,11 @@ class DeviceAllocator:
             text = "\n".join(lines)
         else:
             text = f"[{self.name}] 无未释放块"
+        if deferred:
+            total = sum(b.nbytes for b in deferred)
+            leases = sum(len(b.leases) for b in deferred)
+            text += (f"\n  延迟回收中: {len(deferred)} 个块（{total} 字节）、"
+                     f"外部视图 {leases} 个仍活着（已逻辑释放，显存未还池）")
         if free_blocks:
             text += (f"\n  提示: 池中另有 {free_blocks} 个空闲块（共 {free_bytes} 字节），"
                      f"可 trim() 归还驱动")
@@ -1086,6 +1393,10 @@ class DeviceAllocator:
             evicted, trimmed = self._stat_evicted, self._stat_trimmed
             pinned_free = sum(len(v) for v in self._pinned_free.values())
             pinned_inflight = len(self._pinned_inflight)
+            deferred = list(self._pending_release.values())
+            infos = list(self._blocks.values()) + deferred
+            leased_blocks = sum(1 for b in infos if b.leases)
+            live_leases = sum(len(b.leases) for b in infos)
 
         requests = hits + misses
         out: dict[str, Any] = {
@@ -1120,6 +1431,15 @@ class DeviceAllocator:
             "pinned_bytes": self._pinned_bytes,
             "async_upload_calls": self._stat_async_up,
             "async_download_calls": self._stat_async_down,
+            # ---- 生态互操作（阶段4，FR-6）----
+            "strict_interop": self._strict_interop,
+            "cai_stream": self._cai_stream,
+            "leased_blocks": leased_blocks,
+            "live_leases": live_leases,
+            "deferred_blocks": len(deferred),
+            "deferred_bytes": sum(b.nbytes for b in deferred),
+            "defer_events": self._stat_deferred,
+            "lease_blocked_releases": self._stat_lease_blocked,
         }
         if self._lib is not None:
             # C 侧计数：用于交叉验证「热路径真的没再 cudaMalloc」（NFR-3）

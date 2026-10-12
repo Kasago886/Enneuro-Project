@@ -8,7 +8,8 @@
 
 `dev` 版的前置条件（由 `device_ptr` 统一校验，不满足就抛错而不是静默算错）：
 
-    · 必须是 DeviceBuffer（方案A）或 cupy.ndarray / device='cuda' 的 Tensor（方案B）
+    · 必须是 DeviceBuffer（方案A）、cupy.ndarray / device='cuda' 的 Tensor（方案B），
+      或**任何实现 `__cuda_array_interface__` 的对象**（torch / numba，阶段4）
     · dtype 必须是 float32        —— kernel 只按 float 解释内存
     · 必须 C 连续                 —— 非连续时 .ptr 只指向第一段
     · 必须在当前设备上            —— 与 nvcc 共用 primary context 的硬前提
@@ -35,7 +36,7 @@ from typing import Any, Callable, Optional, Sequence
 
 import numpy as np
 
-from eneuro.utils.dev_memory import DeviceBuffer
+from eneuro.utils.dev_memory import DeviceBuffer, cai_ptr
 
 try:
     import cupy as cp
@@ -149,38 +150,48 @@ def np_ptr(arr: Optional[np.ndarray]):
 def device_ptr(x: Any):
     """取设备指针，并校验前置条件。
 
-    接受三种输入：
+    接受四类输入：
       · `DeviceBuffer`（方案A：自管理显存，句柄已做所有权/设备校验）
       · `cupy.ndarray`（方案B：零拷贝复用 cupy 显存）
       · `eneuro.base.Tensor`（device='cuda'，内部还是 cupy.ndarray）
+      · 任何实现 `__cuda_array_interface__` 的对象（torch / numba / 第三方，
+        **这条路径不需要 cupy**，见阶段4 的 `cai_ptr`）
     """
     # 方案A：句柄的 ptr 属性自带「已释放」检测，取指针是 O(1)，不流出裸指针
     if isinstance(x, DeviceBuffer):
         return VP(x.ptr)
 
-    if cp is None:                                      # pragma: no cover
-        raise RuntimeError("需要 cupy 才能使用方案B 的设备指针接口")
+    # 方案B：cupy / Tensor 走专用分支，错误信息更具体（dtype/连续性/设备号）
+    if cp is not None:
+        from eneuro.base import Tensor as EneTensor
 
-    from eneuro.base import Tensor as EneTensor
+        arr: Any = x
+        if isinstance(arr, EneTensor):
+            if arr.device not in ("cuda", "gpu"):
+                raise ValueError(f"Tensor 在 {arr.device} 上；dev 接口只接受显存数据")
+            arr = arr.data
 
-    arr: Any = x
-    if isinstance(arr, EneTensor):
-        if arr.device not in ("cuda", "gpu"):
-            raise ValueError(f"Tensor 在 {arr.device} 上；dev 接口只接受显存数据")
-        arr = arr.data
+        if isinstance(arr, cp.ndarray):
+            if arr.dtype != cp.float32:
+                # kernel 按 float 解释内存，dtype 不对不会报错，只会算出垃圾值
+                raise TypeError(f"kernel 按 float32 解释内存，实际 dtype = {arr.dtype}")
+            if not arr.flags.c_contiguous:
+                # 非连续时 .ptr 只指向第一段，size 会骗人
+                raise ValueError("需要 C 连续数组；请先 cp.ascontiguousarray（注意会触发隐式拷贝）")
+            if arr.device.id != cp.cuda.runtime.getDevice():
+                raise ValueError(f"数组在第 {arr.device.id} 张卡，当前设备是 "
+                                 f"{cp.cuda.runtime.getDevice()}")
+            return VP(arr.data.ptr)
 
-    if not isinstance(arr, cp.ndarray):
-        raise TypeError(f"需要 cupy.ndarray（或 device='cuda' 的 Tensor），得到 {type(x).__name__}")
-    if arr.dtype != cp.float32:
-        # kernel 按 float 解释内存，dtype 不对不会报错，只会算出垃圾值
-        raise TypeError(f"kernel 按 float32 解释内存，实际 dtype = {arr.dtype}")
-    if not arr.flags.c_contiguous:
-        # 非连续时 .ptr 只指向第一段，size 会骗人
-        raise ValueError("需要 C 连续数组；请先 cp.ascontiguousarray（注意会触发隐式拷贝）")
-    if arr.device.id != cp.cuda.runtime.getDevice():
-        raise ValueError(f"数组在第 {arr.device.id} 张卡，当前设备是 {cp.cuda.runtime.getDevice()}")
+    # 通用兜底：任何实现 CUDA Array Interface 的对象（阶段4）；cupy 缺席也能走
+    if getattr(x, "__cuda_array_interface__", None) is not None:
+        ptr, _nbytes = cai_ptr(x, what=f"device_ptr({type(x).__name__})")
+        return VP(ptr)
 
-    return VP(arr.data.ptr)
+    if cp is None:
+        raise RuntimeError("需要 cupy、DeviceBuffer 或实现 __cuda_array_interface__ 的对象"
+                           "才能使用方案B 的设备指针接口")
+    raise TypeError(f"需要 cupy.ndarray（或 device='cuda' 的 Tensor），得到 {type(x).__name__}")
 
 
 def stream_ptr(stream: Any = None) -> int:
