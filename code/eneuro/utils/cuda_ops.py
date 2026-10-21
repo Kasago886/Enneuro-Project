@@ -210,6 +210,24 @@ def stream_ptr(stream: Any = None) -> int:
     return int(stream.ptr)
 
 
+def _prepare_dev_args(spec_name: str, objs, sid: int) -> None:
+    """下发 kernel 前的两项准备（阶段5）
+
+    1. FR-8.1/8.2：**每个分配器只校验一次**当前设备（不是每个缓冲都查一次 CUDA）
+    2. FR-7.1：把「本块在这个流上用过」告诉 `DeviceBuffer`；
+       `cross_stream_reuse=False`（默认）时该方法立即返回，热路径可忽略
+    """
+    checked: set[int] = set()
+    for obj in objs:
+        if not isinstance(obj, DeviceBuffer):
+            continue
+        aid = id(obj.allocator)
+        if aid not in checked:
+            checked.add(aid)
+            obj.assert_current_device(what=f"ops.dev({spec_name})")
+        obj._ene_note_stream(sid)
+
+
 # ---------------------------------------------------------------------------
 class CudaOps:
     """13 个算子的 host / dev 两套入口的统一封装"""
@@ -273,7 +291,9 @@ class CudaOps:
         fn = self._fns[(spec.name, False)]
         n = int(out.size) if out is not None else int(a.size)
         s = spec.scalar if scalar is None else scalar
-        sp = VP(stream_ptr(stream))
+        sid = stream_ptr(stream)
+        sp = VP(sid)
+        _prepare_dev_args(spec.name, (a, b, out, d_out), sid)
 
         pa = device_ptr(a)
         pb = device_ptr(b) if b is not None else None

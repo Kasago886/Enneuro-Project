@@ -86,6 +86,10 @@ _SMALL_STEP = 256
 _SMALL_MAX = 4096
 _LARGE_MIN = 1 << 20
 
+# debug 越界哨兵（FR-9.2）——头尾各留 256 B，保证用户指针仍是 256 B 对齐
+_GUARD_BYTES = 256
+_GUARD_MAGIC = b"\xee\x11\x22\x33" * (_GUARD_BYTES // 4)
+
 BucketKey = tuple[str, int]                       # (kind, capacity)
 
 
@@ -131,6 +135,10 @@ class BufferReleasedError(DevMemError):
 
 class BufferLeasedError(DevMemError):
     """块上还有未失效的外部视图（cupy/torch 零拷贝包装），此时释放会造成悬垂（FR-6.2）"""
+
+
+class MemoryCorruptionError(DevMemError):
+    """debug 越界哨兵被破坏：肯定发生了越界写（FR-9.2）"""
 
 
 class AllocatorClosedError(DevMemError):
@@ -179,6 +187,13 @@ class _Lib:
         self.dll.ene_mem_available.restype = ctypes.c_int
         self.dll.ene_mem_device.argtypes = []
         self.dll.ene_mem_device.restype = ctypes.c_int
+        # ---- 阶段5：线程级设备绑定 ----
+        self.dll.ene_mem_set_device.argtypes = [ctypes.c_int]
+        self.dll.ene_mem_set_device.restype = ctypes.c_int
+        for name in ("ene_mem_current_device", "ene_mem_cached_device"):
+            fn = getattr(self.dll, name)
+            fn.argtypes = []
+            fn.restype = ctypes.c_int
         self.dll.ene_mem_device_count.argtypes = []
         self.dll.ene_mem_device_count.restype = ctypes.c_int
         self.dll.ene_mem_last_code.argtypes = []
@@ -275,6 +290,22 @@ class _BlockInfo:
     # 存 weakref 而不是直接存标记对象 —— 直接存会形成「块→标记→块」的引用环，
     # 标记永远死不了，租约也就永远不释放。
     leases: set = field(default_factory=set)
+    # 跨流复用保护（阶段5，FR-7.1）：最后使用本块的流；复用前要等它。
+    last_stream: int = 0
+    guard_event: int = 0                          # 已释放但目标流可能还在用时的守卫事件
+    # debug 越界哨兵（阶段5，FR-9.2）：真实分配起点与占用字节数（0 = 等于 ptr/capacity）
+    base_ptr: int = 0
+    physical: int = 0
+
+    @property
+    def alloc_ptr(self) -> int:
+        """真正要归还给驱动的指针（debug 哨兵下含头部保护区）"""
+        return self.base_ptr or self.ptr
+
+    @property
+    def alloc_bytes(self) -> int:
+        """真正从驱动/GC 拿到的字节数（debug 哨兵下含头尾保护区）"""
+        return self.physical or self.capacity
 
     @property
     def size(self) -> int:
@@ -292,6 +323,18 @@ class _BlockInfo:
         return (f"#{self.tag:<4} {self.name:<12} ptr=0x{self.ptr:012x} "
                 f"请求 {self.nbytes:>9} B / 实占 {self.capacity:>9} B "
                 f"({self.size} × {self.dtype}) {where} {bucket}")
+
+
+# ---------------------------------------------------------------------------
+# debug 越界哨兵（阶段5，FR-9.2）
+#
+# 仅在 DeviceAllocator(debug=True) 时启用：真实分配比用户请求的多 2×256 B，
+# 用户指针居中。首尾各写一段魔术字：release 时有一侧对不上，就说明有人越界写了。
+# 已损坏的块**绝不回池**，直接还给驱动 —— 脏数据不能流到下一个使用者手里。
+#
+# 读写必须走 `ene_mem_upload/download`：设备内存不能由主机直接 memmove。
+# 具体实现见 `DeviceAllocator._write_guards / _check_guards`。
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +563,37 @@ class DeviceBuffer:
         return len(self._info.leases)
 
     @property
+    def allocator(self) -> "DeviceAllocator":
+        """本块所属的分配器"""
+        return self._alloc
+
+    def assert_current_device(self, *, what: str = "算子") -> None:
+        """校验本块就在当前设备上（FR-8.1 / FR-8.2）
+
+        跨设备访问**必须报错**，绝不隐式拷贝 —— 静默拷贝会让性能与显存都失控，
+        而且掩盖了调用方的逻辑错误。`strict_device=False` 时不做检查。
+        """
+        info = self._info
+        if info.released:
+            raise BufferReleasedError(f"块 {info.name!r} 已被释放，不能再使用")
+        if info.device < 0 or not self._alloc._strict_device:
+            return
+        cur = self._alloc.current_device()
+        if cur >= 0 and cur != info.device:
+            raise DeviceError(
+                f"{what}: 块 {info.name!r} 在第 {info.device} 张卡，当前设备是 {cur}"
+                f"（不会隐式拷贝，请显式把数据搬到对应设备）")
+
+    def _ene_note_stream(self, stream: int) -> None:
+        """记录本块最后一次被哪个流使用（FR-7.1）
+
+        由 `CudaOps.dev()` 在取指针时顺带调用。`cross_stream_reuse=False`（默认）
+        时第一行就返回，热路径开销可忽略。
+        """
+        if self._alloc._cross_stream and stream and not self._info.released:
+            self._info.last_stream = int(stream)
+
+    @property
     def ptr(self) -> int:
         """裸设备指针。仅供下发 kernel 使用（FR-5.2，O(1)）。"""
         if self._info.released:
@@ -702,16 +776,21 @@ class DeviceAllocator:
                  pool_max_bytes: Optional[int] = None,
                  chunk_bytes: int = 16 << 20,
                  strict_interop: bool = False,
-                 cai_stream: int = 0):
+                 cai_stream: int = 0,
+                 strict_device: bool = True,
+                 cross_stream_reuse: bool = False,
+                 debug: bool = False):
         """
         Args:
-            pool: 是否启用内存池；False 时退化为阶段1 的直通分配（每次 cudaMalloc）
-            pool_max_block: 超过此容量的块不进池（None = 不限；传 1<<20 即设计文档原行为）
+            pool: 是否启用内存池；False 时退化为直通分配（每次 cudaMalloc）
+            pool_max_block: 超过此容量的块不进池（None = 不限）
             pool_max_bytes: 池中空闲内存总量上限，超出按 FIFO 驱逐最旧的（None = 不限）
-            chunk_bytes: 单次传输最大字节数，超过则自动分片（FR-3.3）
-            strict_interop: True 时禁止 `__cuda_array_interface__` 的「瞬时借出」，
-                所有外部视图必须走 `as_cupy()`（阶段4，FR-6.2）
-            cai_stream: 写进 `__cuda_array_interface__['stream']` 的流（0 = legacy 默认流）
+            chunk_bytes: 单次传输最大字节数，超过则自动分片
+            strict_interop: True 时禁止 `__cuda_array_interface__` 的「瞬时借出」
+            cai_stream: 写进 `__cuda_array_interface__['stream']` 的流（0 = 默认流）
+            strict_device: True 时算子下发前校验「块所在设备 == 当前设备」（FR-8.1/8.2）
+            cross_stream_reuse: True 时记录每块最后使用的流，跨流复用前用事件建立依赖（FR-7.1/7.3）
+            debug: True 时启用头尾越界哨兵（每块额外 2×256 B，release 时校验，FR-9.2）
         """
         global _ATEXIT_REGISTERED
 
@@ -726,6 +805,12 @@ class DeviceAllocator:
         self._pending_release: dict[int, _BlockInfo] = {}
         self._strict_interop = bool(strict_interop)
         self._cai_stream = int(cai_stream)
+        # 阶段5：设备绑定 / 跨流复用 / debug 哨兵
+        self._strict_device = bool(strict_device)
+        self._cross_stream = bool(cross_stream_reuse)
+        self._debug = bool(debug)
+        self._bound = -1                             # 本线程已绑定的设备（缓存）
+        self._stream_guard: list[_BlockInfo] = []    # 已释放、但目标流可能还在用的块
 
         # ---- 内存池（阶段2）----
         self._pool = bool(pool)
@@ -759,6 +844,9 @@ class DeviceAllocator:
         self._stat_async_down = 0
         self._stat_deferred = 0                        # 阶段4：进入延迟回收的次数
         self._stat_lease_blocked = 0                   # 阶段4：因租约未清被拒绝释放的次数
+        self._stat_stream_guards = 0                   # 阶段5：进入跨流守卫的块数
+        self._stat_cross_stream_waits = 0              # 阶段5：因跨流复用插入的事件等待数
+        self._stat_guard_failures = 0                  # 阶段5：越界哨兵被破坏的次数
 
         self._lib: Optional[_Lib] = None
         self._host_mode = True
@@ -770,7 +858,9 @@ class DeviceAllocator:
                 code = int(self._lib.dll.ene_mem_init(int(device)))
                 if code == ENE_OK:
                     self._host_mode = False
-                    self._device = int(self._lib.dll.ene_mem_device())
+                    # init 已把 device<0 归一为 0，并且已经 cudaSetDevice 到了那张卡
+                    self._device = max(int(device), 0)
+                    self._bound = self._device
                 elif code == ENE_ERR_NODEVICE:
                     # FR-10.1：无 CUDA 环境时回退到主机内存，API 不崩
                     self._host_mode = True
@@ -798,6 +888,40 @@ class DeviceAllocator:
     def mode(self) -> str:
         return "host-fallback" if self._host_mode else f"cuda:{self._device}"
 
+    # ---- 设备绑定（阶段5，FR-8）----
+    def _bind_device(self) -> None:
+        """把**本线程**绑定到本分配器的设备
+
+        CUDA 的 current device 是**线程局部**的，而同一线程可能交替使用两个分配器
+        （比如先 device 0、再 device 1、又回到 device 0）。
+
+        这里**必须每次向 C 层确认**，不能用 Python 侧的 `self._bound` 做短路：
+        另一个 allocator 可能已经把这个线程绑到了别的卡，而 `self._bound` 仍然
+        记着旧值 —— 那样就会跳过绑定，退回「静默分错卡」。
+
+        真正的判重在 C 层：`g_current` 是线程局部的，命中时只是比较一个 int。
+        """
+        if self._host_mode or self._lib is None:
+            return
+        code = int(self._lib.dll.ene_mem_set_device(int(self._device)))
+        self._lib._check(code, f"绑定设备 {self._device}")
+        self._bound = self._device                   # 仅用于诊断/统计
+
+    def current_device(self) -> int:
+        """当前线程**真实**的设备号（向 CUDA 查询，主机回退模式返回 -1）
+
+        用于 FR-8.1/8.2 的跨设备校验，不要放在热路径上。
+        """
+        if self._host_mode or self._lib is None:
+            return -1
+        return int(self._lib.dll.ene_mem_current_device())
+
+    def cached_device(self) -> int:
+        """本线程的**缓存**设备号（不调 CUDA；可能滞后于外部 `cudaSetDevice`）"""
+        if self._host_mode or self._lib is None:
+            return -1
+        return int(self._lib.dll.ene_mem_cached_device())
+
     # ---- 分配 ----
     def _bucket_for(self, nbytes: int) -> tuple[Optional[BucketKey], int]:
         """决定这次分配走哪个桶（None = 不进池）"""
@@ -809,7 +933,13 @@ class DeviceAllocator:
         return key, capacity
 
     def alloc_bytes(self, nbytes: int, *, dtype: Any = np.uint8,
-                    name: str = "buffer") -> DeviceBuffer:
+                    name: str = "buffer",
+                    stream: Optional[int] = None) -> DeviceBuffer:
+        """分配一块显存
+
+        `stream` 只用于**跨流复用**：指定这块显存接下来将在这个流上使用，
+        若复用的是被别的流用过的块，会插入一次 `cudaStreamWaitEvent`（主机不阻塞）。
+        """
         self._ensure_open()
         if not isinstance(nbytes, (int, np.integer)) or nbytes <= 0:
             raise InvalidArgumentError(f"nbytes 必须是正整数，得到 {nbytes!r}")
@@ -817,8 +947,16 @@ class DeviceAllocator:
         dt = np.dtype(dtype)
         key, capacity = self._bucket_for(nbytes)
 
+        # ---- 阶段5：先把「流已跑完」的守卫块放回池（FR-7.1）----
+        # 不放在这里的话，只要后续分配的都是别的尺寸（走不到 _take_guarded），
+        # 已完成的守卫块就会一直挂在表里，等于那部分池容量永久不可用。
+        # 默认配置（cross_stream_reuse=False）守卫表永远是空的，这里零成本。
+        if self._stream_guard:
+            self._sweep_stream_guard()
+
         # ---- 快路径：池命中（FR-2.1 / NFR-3，完全不碰 CUDA）----
         if key is not None:
+            reused: Optional[_BlockInfo] = None
             with self._lock:
                 bucket = self._free.get(key)
                 if bucket:
@@ -827,30 +965,61 @@ class DeviceAllocator:
                         del self._free[key]
                     self._free_bytes -= old.capacity
                     self._stat_pool_hits += 1
-                    return self._register(self._reuse_info(old, nbytes, dt, name, key))
+                    reused = self._reuse_info(old, nbytes, dt, name, key)
+            if reused is not None:
+                if self._debug and reused.base_ptr:
+                    self._write_guards(reused)       # 锁外写：不持锁调 CUDA（FR-11.2）
+                return self._register(reused)
+
+        # ---- 跨流复用（FR-7.1）：从守卫里取块，用事件建立依赖，主机不阻塞 ----
+        if self._cross_stream and key is not None:
+            taken = self._take_guarded(key)
+            if taken is not None:
+                old, ev = taken
+                if ev:
+                    self.wait_event(ev, stream_ptr(stream))
+                    self.destroy_event(ev)
+                    self._stat_cross_stream_waits += 1
+                self._stat_pool_hits += 1
+                info = self._reuse_info(old, nbytes, dt, name, key)
+                if self._debug and info.base_ptr:
+                    self._write_guards(info)
+                return self._register(info)
 
         # ---- 慢路径：真正向驱动申请（cudaMalloc 约 0.25 ms/次）----
         self._stat_pool_misses += 1
         self._counter += 1
         info = _BlockInfo(ptr=0, nbytes=nbytes, capacity=capacity, dtype=dt,
                           device=-1, name=name, tag=self._counter, cls=key)
+        guard = 2 * _GUARD_BYTES if self._debug else 0
+        total = capacity + guard
 
         if self._host_mode:
-            buf = bytearray(capacity)
+            buf = bytearray(total)
             info.host = buf
-            info.ptr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
+            base = ctypes.addressof(ctypes.c_char.from_buffer(buf))
             info.device = -1
         else:
             assert self._lib is not None
-            ptr = self._lib.dll.ene_mem_alloc(ctypes.c_size_t(capacity))
-            if not ptr:
+            self._bind_device()
+            raw = self._lib.dll.ene_mem_alloc(ctypes.c_size_t(total))
+            if not raw:
                 code, msg = self._lib.last_error()
-                _raise_for(code, f"分配 {capacity} 字节失败: {msg}")
-            if ptr % 256 != 0:                       # FR-1.3 自检（cudaMalloc 本身保证 ≥256B）
-                self._lib.dll.ene_mem_free(ctypes.c_void_p(ptr))
-                raise DevMemError(f"分配返回的指针未按 256B 对齐: 0x{ptr:x}")
-            info.ptr = int(ptr)
+                _raise_for(code, f"分配 {total} 字节失败: {msg}")
+            if raw % 256 != 0:                       # FR-1.3 自检（cudaMalloc 本身保证 ≥256B）
+                self._lib.dll.ene_mem_free(ctypes.c_void_p(raw))
+                raise DevMemError(f"分配返回的指针未按 256B 对齐: 0x{raw:x}")
+            base = int(raw)
             info.device = self._device
+
+        if guard:
+            # 用户指针居中，头尾各 256 B 哨兵；ptr 仍然是 256 B 对齐
+            info.base_ptr = base
+            info.physical = total
+            info.ptr = base + _GUARD_BYTES
+            self._write_guards(info)
+        else:
+            info.ptr = base
 
         return self._register(info)
 
@@ -862,9 +1031,11 @@ class DeviceAllocator:
         这是最典型的一类悬垂别名 bug。新建对象则旧句柄仍然会正确报错。
         """
         self._counter += 1
-        return _BlockInfo(ptr=old.ptr, nbytes=nbytes, capacity=old.capacity, dtype=dt,
+        info = _BlockInfo(ptr=old.ptr, nbytes=nbytes, capacity=old.capacity, dtype=dt,
                           device=old.device, name=name, host=old.host,
-                          tag=self._counter, cls=key)
+                          tag=self._counter, cls=key,
+                          base_ptr=old.base_ptr, physical=old.physical)
+        return info
 
     def _register(self, info: _BlockInfo) -> DeviceBuffer:
         with self._lock:
@@ -875,19 +1046,21 @@ class DeviceAllocator:
                 self._peak_live_bytes = self._live_bytes
         return DeviceBuffer(self, info)
 
-    def alloc(self, size: int, *, dtype: Any = np.float32, name: str = "buffer") -> DeviceBuffer:
+    def alloc(self, size: int, *, dtype: Any = np.float32, name: str = "buffer",
+              stream: Optional[int] = None) -> DeviceBuffer:
         """按元素个数分配。默认 float32 —— 与 13 个算子的内存解释一致。"""
         self._ensure_open()
         if not isinstance(size, (int, np.integer)) or size <= 0:
             raise InvalidArgumentError(f"size 必须是正整数，得到 {size!r}")
         dt = np.dtype(dtype)
-        return self.alloc_bytes(int(size) * dt.itemsize, dtype=dt, name=name)
+        return self.alloc_bytes(int(size) * dt.itemsize, dtype=dt, name=name, stream=stream)
 
-    def alloc_like(self, arr: np.ndarray, *, name: str = "buffer") -> DeviceBuffer:
+    def alloc_like(self, arr: np.ndarray, *, name: str = "buffer",
+                   stream: Optional[int] = None) -> DeviceBuffer:
         """按 numpy 数组的形状/类型分配（不做任何拷贝）"""
         if not isinstance(arr, np.ndarray):
             raise InvalidArgumentError(f"需要 numpy 数组，得到 {type(arr).__name__}")
-        return self.alloc(arr.size, dtype=arr.dtype, name=name)
+        return self.alloc(arr.size, dtype=arr.dtype, name=name, stream=stream)
 
     # ---- 传输 ----
     def _upload(self, info: _BlockInfo, src: np.ndarray, stream: Optional[int]) -> None:
@@ -898,6 +1071,7 @@ class DeviceAllocator:
             ctypes.memmove(info.ptr, arr.ctypes.data, arr.nbytes)
         else:
             assert self._lib is not None
+            self._bind_device()
             code = int(self._lib.dll.ene_mem_upload(
                 ctypes.c_void_p(info.ptr), ctypes.c_void_p(arr.ctypes.data),
                 ctypes.c_size_t(arr.nbytes), ctypes.c_void_p(stream or 0)))
@@ -912,6 +1086,7 @@ class DeviceAllocator:
             ctypes.memmove(arr.ctypes.data, info.ptr, arr.nbytes)
         else:
             assert self._lib is not None
+            self._bind_device()
             code = int(self._lib.dll.ene_mem_download(
                 ctypes.c_void_p(arr.ctypes.data), ctypes.c_void_p(info.ptr),
                 ctypes.c_size_t(arr.nbytes), ctypes.c_void_p(stream or 0)))
@@ -927,9 +1102,11 @@ class DeviceAllocator:
         if self._host_mode:
             return
         assert self._lib is not None
+        self._bind_device()
         code = int(self._lib.dll.ene_mem_sync(ctypes.c_void_p(stream or 0)))
         self._lib._check(code, "sync")
         self._sweep_pinned(force_stream=stream_ptr(stream))
+        self._sweep_stream_guard()
 
     # ---- 流与事件（阶段3）----
     def new_stream(self) -> int:
@@ -938,6 +1115,7 @@ class DeviceAllocator:
         if self._host_mode:
             return 0
         assert self._lib is not None
+        self._bind_device()
         ptr = self._lib.dll.ene_mem_stream_create()
         if not ptr:
             code, msg = self._lib.last_error()
@@ -948,6 +1126,7 @@ class DeviceAllocator:
         if self._host_mode or not stream:
             return
         assert self._lib is not None
+        self._bind_device()
         self._lib._check(int(self._lib.dll.ene_mem_stream_destroy(ctypes.c_void_p(stream))),
                          "destroy_stream")
 
@@ -955,6 +1134,7 @@ class DeviceAllocator:
         """新建事件（默认关闭计时，更快）。用完请 destroy_event。"""
         if self._lib is None:
             raise DevMemError("主机回退模式下没有 CUDA 事件")
+        self._bind_device()
         fn = self._lib.dll.ene_mem_event_create_timed if timed else self._lib.dll.ene_mem_event_create
         ev = fn()
         if not ev:
@@ -964,34 +1144,40 @@ class DeviceAllocator:
 
     def record_event_on(self, event: int, stream: Optional[int] = None) -> None:
         assert self._lib is not None
+        self._bind_device()
         self._lib._check(int(self._lib.dll.ene_mem_event_record(
             ctypes.c_void_p(event), ctypes.c_void_p(stream or 0))), "record_event")
 
     def wait_event(self, event: int, stream: Optional[int] = None) -> None:
         """让 stream 上**后续**的工作都等该事件触发"""
         assert self._lib is not None
+        self._bind_device()
         self._lib._check(int(self._lib.dll.ene_mem_event_wait(
             ctypes.c_void_p(event), ctypes.c_void_p(stream or 0))), "wait_event")
 
     def event_sync(self, event: int) -> None:
-        """主机阻塞等该事件"""
+        """主机等该事件（会阻塞，不许在持锁时调）"""
         assert self._lib is not None
+        self._bind_device()
         self._lib._check(int(self._lib.dll.ene_mem_event_sync(ctypes.c_void_p(event))),
                          "event_sync")
 
     def event_done(self, event: int) -> bool:
         """非阻塞查询事件是否已完成"""
         assert self._lib is not None
+        self._bind_device()
         return bool(self._lib.dll.ene_mem_event_done(ctypes.c_void_p(event)))
 
     def destroy_event(self, event: int) -> None:
         if self._lib is None or not event:
             return
+        self._bind_device()
         self._lib.dll.ene_mem_event_destroy(ctypes.c_void_p(event))
 
     def event_elapsed(self, start: int, end: int) -> float:
         """两个**计时事件**之间的 GPU 侧毫秒数（需用 create_event(timed=True) 创建）"""
         assert self._lib is not None
+        self._bind_device()
         return float(self._lib.dll.ene_mem_event_elapsed(
             ctypes.c_void_p(start), ctypes.c_void_p(end)))
 
@@ -1035,6 +1221,7 @@ class DeviceAllocator:
             return PinnedBuffer(self, ctypes.addressof(raw), nbytes, dtype, name, backing=raw)
 
         assert self._lib is not None
+        self._bind_device()
         ptr = self._lib.dll.ene_mem_host_alloc(ctypes.c_size_t(nbytes))
         if not ptr:
             code, msg = self._lib.last_error()
@@ -1065,6 +1252,7 @@ class DeviceAllocator:
         if backing is not None:
             return                                       # 主机回退：交回 GC
         if self._lib is not None:
+            self._bind_device()
             self._lib.dll.ene_mem_host_free(ctypes.c_void_p(ptr))
 
     def _sweep_pinned(self, force_stream: Optional[int] = None) -> int:
@@ -1092,6 +1280,7 @@ class DeviceAllocator:
                     stream: Optional[int], *, up: bool) -> None:
         """分片下发拷贝（FR-3.3）：单次不超过 chunk_bytes"""
         assert self._lib is not None
+        self._bind_device()
         s = ctypes.c_void_p(stream or 0)
         fn = self._lib.dll.ene_mem_upload_async if up else self._lib.dll.ene_mem_download_async
         what = "upload_async" if up else "download_async"
@@ -1162,6 +1351,45 @@ class DeviceAllocator:
         return DoubleBuffer(self, size, dtype=dtype, slots=slots, name=name)
 
     # ---- 生命周期 ----
+    def _raw_copy(self, dev_ptr: int, data: bytes, *, up: bool) -> bytes:
+        """小段主机↔设备拷贝（哨兵专用；同步语义）"""
+        assert self._lib is not None
+        self._bind_device()
+        buf = ctypes.create_string_buffer(data, len(data))
+        host = ctypes.c_void_p(ctypes.addressof(buf))
+        dev = ctypes.c_void_p(dev_ptr)
+        fn = self._lib.dll.ene_mem_upload if up else self._lib.dll.ene_mem_download
+        args = (dev, host) if up else (host, dev)
+        code = int(fn(args[0], args[1], ctypes.c_size_t(len(data)), ctypes.c_void_p(0)))
+        self._lib._check(code, "越界哨兵拷贝")
+        return buf.raw
+
+    def _write_guards(self, info: _BlockInfo) -> None:
+        """在用户区前后各写一段魔术字（必须先经 C 层拷贝：设备内存不能由 CPU 直接写）"""
+        tail = info.base_ptr + _GUARD_BYTES + info.capacity
+        if info.host is not None:                    # 主机回退：普通内存，直接写
+            ctypes.memmove(info.base_ptr, _GUARD_MAGIC, _GUARD_BYTES)
+            ctypes.memmove(tail, _GUARD_MAGIC, _GUARD_BYTES)
+            return
+        self._raw_copy(info.base_ptr, _GUARD_MAGIC, up=True)
+        self._raw_copy(tail, _GUARD_MAGIC, up=True)
+
+    def _check_guards(self, info: _BlockInfo) -> Optional[str]:
+        """返回被破坏的位置描述（None = 完好）"""
+        tail = info.base_ptr + _GUARD_BYTES + info.capacity
+        if info.host is not None:
+            head = ctypes.string_at(info.base_ptr, _GUARD_BYTES)
+            back = ctypes.string_at(tail, _GUARD_BYTES)
+        else:
+            head = self._raw_copy(info.base_ptr, _GUARD_MAGIC, up=False)
+            back = self._raw_copy(tail, _GUARD_MAGIC, up=False)
+        bad = []
+        if head != _GUARD_MAGIC:
+            bad.append("头部")
+        if back != _GUARD_MAGIC:
+            bad.append("尾部")
+        return "与".join(bad) if bad else None
+
     def _release(self, info: _BlockInfo, *, quiet: bool, force: bool = False) -> None:
         # 阶段4（FR-6.2）：还有外部视图活着时，绝不能把这块显存拿去复用
         if info.leases and not force:
@@ -1176,6 +1404,11 @@ class DeviceAllocator:
                 f"外部视图（as_cupy 出来的数组）未失效，现在释放会让它们指向已被复用的显存。"
                 f"请先删除这些数组，或 release(force=True)")
 
+        # 阶段5（FR-9.2）：debug 模式下先查越界哨兵
+        corrupt = None
+        if self._debug and info.base_ptr and not info.released:
+            corrupt = self._check_guards(info)
+
         with self._lock:
             if info.released:
                 if quiet:
@@ -1189,7 +1422,71 @@ class DeviceAllocator:
                 del self._pending_release[info.ptr]
             self._stat_frees += 1
             self._live_bytes -= info.nbytes
+            if corrupt:
+                self._stat_guard_failures += 1
+
+        if corrupt:
+            # 脏内存绝不能流到下一个使用者：直接还给驱动，不进池
+            self._free_native(info, quiet=True)
+            if not quiet:
+                raise MemoryCorruptionError(
+                    f"块 {info.name!r}(ptr=0x{info.ptr:x}) 的{corrupt}哨兵被破坏，"
+                    f"疑似越界写（请求 {info.nbytes} B / 桶容量 {info.capacity} B）。"
+                    f"该块已归还驱动，不进入池")
+            return
+
+        # 阶段5（FR-7.1）：最后一个使用它的流可能还没跑完 → 挂事件，复用时再等
+        if (self._cross_stream and info.last_stream and not self._closed
+                and not self._host_mode and self._lib is not None):
+            self._guard_stream(info)
+            return
+
         self._pool_or_free(info)
+
+    def _guard_stream(self, info: _BlockInfo) -> None:
+        """块已逻辑释放，但最后使用它的流可能还在跑 → 挂个事件，不阻塞主机"""
+        sid = info.last_stream
+        info.last_stream = 0
+        ev = self.create_event()
+        self.record_event_on(ev, sid)
+        with self._lock:
+            info.guard_event = ev
+            self._stream_guard.append(info)
+            self._stat_stream_guards += 1
+
+    def _take_guarded(self, key: BucketKey) -> Optional[tuple[_BlockInfo, int]]:
+        """从跨流守卫里取一块同桶的块（调用方负责在外面插入事件等待）"""
+        with self._lock:
+            for i, blk in enumerate(self._stream_guard):
+                if blk.cls == key:
+                    self._stream_guard.pop(i)
+                    ev = blk.guard_event
+                    blk.guard_event = 0
+                    return blk, ev
+        return None
+
+    def _sweep_stream_guard(self) -> int:
+        """把已经跑完的守卫块放回池（查询事件，不阻塞；绝不持锁调 CUDA）"""
+        if not self._stream_guard or self._lib is None:
+            return 0
+        with self._lock:
+            pending = [(blk, blk.guard_event) for blk in self._stream_guard]
+        done: list[_BlockInfo] = []
+        for blk, ev in pending:
+            if ev and self.event_done(ev):
+                done.append(blk)
+        cleared = 0
+        for blk in done:
+            with self._lock:
+                try:
+                    self._stream_guard.remove(blk)
+                except ValueError:                   # 已被别的线程取走
+                    continue
+                ev, blk.guard_event = blk.guard_event, 0
+            self.destroy_event(ev)
+            self._pool_or_free(blk)
+            cleared += 1
+        return cleared
 
     def _pool_or_free(self, info: _BlockInfo) -> None:
         """把「已经逻辑释放」的块放回池里等复用，或直接归还驱动（FR-2.1）
@@ -1198,14 +1495,15 @@ class DeviceAllocator:
         """
         victims: list[_BlockInfo] = []
         with self._lock:
-            recycle = info.cls is not None and not self._closed
-            if recycle:
+            recycle = False
+            if info.cls is not None and not self._closed:
                 self._free_seq += 1
                 info.free_seq = self._free_seq
                 info.free_time = time.monotonic()
                 self._free.setdefault(info.cls, []).append(info)
                 self._free_bytes += info.capacity
                 self._stat_recycled += 1
+                recycle = True
                 victims = self._evict_locked()        # FR-2.6：超上限则驱逐最旧的
         if not recycle:
             self._free_native(info, quiet=True)
@@ -1249,7 +1547,8 @@ class DeviceAllocator:
             return
         if self._lib is None:
             return
-        code = int(self._lib.dll.ene_mem_free(ctypes.c_void_p(info.ptr)))
+        self._bind_device()
+        code = int(self._lib.dll.ene_mem_free(ctypes.c_void_p(info.alloc_ptr)))
         if code != ENE_OK and not quiet:
             err_code, msg = self._lib.last_error()
             _raise_for(err_code, f"释放 0x{info.ptr:x} 失败: {msg}")
@@ -1335,12 +1634,14 @@ class DeviceAllocator:
             pending = list(self._blocks.values())
             pooled = [b for bucket in self._free.values() for b in bucket]
             deferred = list(self._pending_release.values())
+            guarded = list(self._stream_guard)
             pinned = [t for bucket in self._pinned_free.values() for t in bucket]
             inflight = [(b._ptr, b.nbytes, b._backing) for b, _, _ in self._pinned_inflight]
             events = [ev for _, _, ev in self._pinned_inflight]
             self._free.clear()
             self._free_bytes = 0
             self._pending_release.clear()
+            self._stream_guard = []
             self._pinned_free.clear()
             self._pinned_inflight = []
         stray = sum(len(b.leases) for b in deferred)
@@ -1350,6 +1651,11 @@ class DeviceAllocator:
         for info in pending:
             self._release(info, quiet=True)           # 走正常回收路径（已关闭 → 直接 free）
         for info in pooled + deferred:
+            self._free_native(info, quiet=True)
+        for info in guarded:                          # 跨流守卫中的块（已逻辑释放）
+            if info.guard_event:
+                self.destroy_event(info.guard_event)
+                info.guard_event = 0
             self._free_native(info, quiet=True)
         for ev in events:
             self.destroy_event(ev)
@@ -1397,6 +1703,10 @@ class DeviceAllocator:
             infos = list(self._blocks.values()) + deferred
             leased_blocks = sum(1 for b in infos if b.leases)
             live_leases = sum(len(b.leases) for b in infos)
+            stream_guarded = len(self._stream_guard)
+            strict_device = self._strict_device
+            cross_stream = self._cross_stream
+            debug_guards = self._debug
 
         requests = hits + misses
         out: dict[str, Any] = {
@@ -1440,6 +1750,14 @@ class DeviceAllocator:
             "deferred_bytes": sum(b.nbytes for b in deferred),
             "defer_events": self._stat_deferred,
             "lease_blocked_releases": self._stat_lease_blocked,
+            # ---- 多设备与并发（阶段5，FR-7 / FR-8 / FR-9.2 / FR-11）----
+            "strict_device": strict_device,
+            "cross_stream_reuse": cross_stream,
+            "debug_guards": debug_guards,
+            "stream_guarded_blocks": stream_guarded,
+            "stream_guards": self._stat_stream_guards,
+            "cross_stream_waits": self._stat_cross_stream_waits,
+            "guard_failures": self._stat_guard_failures,
         }
         if self._lib is not None:
             # C 侧计数：用于交叉验证「热路径真的没再 cudaMalloc」（NFR-3）

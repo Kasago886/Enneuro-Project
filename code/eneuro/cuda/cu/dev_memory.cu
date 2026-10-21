@@ -7,10 +7,13 @@
 //   · 元数据放主机侧，设备端不加块头 —— 保证 cudaMalloc 返回的 256B 对齐不被破坏。
 //   · 阶段1 的传输是**同步语义**（内部 memcpyAsync + StreamSynchronize）；
 //     阶段3 只需去掉那次 synchronize 就能变成真正的异步流水线。
+//   · 阶段5：设备状态改为**每线程显式绑定**（`ene_mem_set_device`），计数改为原子，
+//     使多卡/多线程下不再依赖「进程全局当前设备」。
 //   · cudaMalloc 本身保证 ≥256B 对齐（Python 侧会自检兜底）。
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <string.h>
+#include <atomic>
 
 #if defined(_WIN32)
 #define ENE_EXPORT extern "C" __declspec(dllexport)
@@ -40,12 +43,16 @@ static ENE_TLS char g_last_msg[256];
 static ENE_TLS int  g_last_code = ENE_OK;
 
 static int                g_available = 0;
+// `g_device` 只作「最近一次 init 用的是哪张卡」的信息；
+// 真正决定 CUDA 调幅落在那张卡上的是**线程局部的当前设备**（阶段5）。
 static int                g_device    = -1;
-static unsigned long long g_alloc_calls = 0;
-static unsigned long long g_free_calls  = 0;
-static unsigned long long g_up_bytes    = 0;
-static unsigned long long g_down_bytes  = 0;
-static unsigned long long g_host_alloc_calls = 0;
+static ENE_TLS int        g_current   = -1;      // 本线程已绑定的设备（O(1) 缓存）
+// 计数器：C 侧可能被多线程并发递增（FR-11.1），必须是原子的
+static std::atomic<unsigned long long> g_alloc_calls{0};
+static std::atomic<unsigned long long> g_free_calls{0};
+static std::atomic<unsigned long long> g_up_bytes{0};
+static std::atomic<unsigned long long> g_down_bytes{0};
+static std::atomic<unsigned long long> g_host_alloc_calls{0};
 
 static void ene_set_error(int code, const char *msg) {
     g_last_code = code;
@@ -91,10 +98,52 @@ int ene_mem_init(int device) {
         return g_last_code;
     }
     g_device    = device;
+    g_current   = device;                            // 本线程已经在这张卡上
     g_available = 1;
     ene_set_error(ENE_OK, "");
     return ENE_OK;
 }
+
+// 把**本线程**绑定到指定设备（阶段5）。已绑定时零成本。
+ENE_EXPORT
+int ene_mem_set_device(int device) {
+    if (!g_available) {
+        ene_set_error(ENE_ERR_NODEVICE, "device memory not initialized");
+        return ENE_ERR_NODEVICE;
+    }
+    if (device < 0) {
+        ene_set_error(ENE_ERR_DEVICE, "device index must be >= 0");
+        return ENE_ERR_DEVICE;
+    }
+    if (g_current == device) {                       // 快路径：不碰 CUDA
+        ene_set_error(ENE_OK, "");
+        return ENE_OK;
+    }
+    cudaError_t err = cudaSetDevice(device);
+    if (err != cudaSuccess) {
+        ene_set_cuda_error(err);
+        return g_last_code;
+    }
+    g_current = device;
+    ene_set_error(ENE_OK, "");
+    return ENE_OK;
+}
+
+// 当前设备（权威值：向 CUDA 查询，同时刷新线程局部缓存）。
+// 用来做 FR-8.1/8.2 的跨设备校验；不可用于热路径。
+ENE_EXPORT
+int ene_mem_current_device(void) {
+    int d = -1;
+    if (cudaGetDevice(&d) == cudaSuccess) {
+        g_current = d;
+        return d;
+    }
+    return g_current;
+}
+
+// 当前设备（缓存值：不调 CUDA，可能滞后于外部 cudaSetDevice）。
+ENE_EXPORT
+int ene_mem_cached_device(void) { return g_current; }
 
 ENE_EXPORT
 int ene_mem_available(void) { return g_available; }
@@ -148,7 +197,7 @@ void *ene_mem_alloc(size_t bytes) {
         ene_set_cuda_error(err);                     // FR-1.2：区分 OOM 与其他错误
         return NULL;
     }
-    g_alloc_calls++;
+    g_alloc_calls.fetch_add(1, std::memory_order_relaxed);
     ene_set_error(ENE_OK, "");
     return ptr;
 }
@@ -164,7 +213,7 @@ int ene_mem_free(void *ptr) {
         ene_set_cuda_error(err);
         return g_last_code;
     }
-    g_free_calls++;
+    g_free_calls.fetch_add(1, std::memory_order_relaxed);
     ene_set_error(ENE_OK, "");
     return ENE_OK;
 }
@@ -192,7 +241,7 @@ int ene_mem_upload(void *d_ptr, const void *h_ptr, size_t bytes, void *stream) {
         ene_set_cuda_error(err);
         return g_last_code;
     }
-    g_up_bytes += (unsigned long long)bytes;
+    g_up_bytes.fetch_add((unsigned long long)bytes, std::memory_order_relaxed);
     ene_set_error(ENE_OK, "");
     return ENE_OK;
 }
@@ -216,7 +265,7 @@ int ene_mem_download(void *h_ptr, const void *d_ptr, size_t bytes, void *stream)
         ene_set_cuda_error(err);
         return g_last_code;
     }
-    g_down_bytes += (unsigned long long)bytes;
+    g_down_bytes.fetch_add((unsigned long long)bytes, std::memory_order_relaxed);
     ene_set_error(ENE_OK, "");
     return ENE_OK;
 }
@@ -378,7 +427,7 @@ void *ene_mem_host_alloc(size_t bytes) {
         ene_set_cuda_error(err);                     // 显存/锁页内存不足也是 OOM
         return NULL;
     }
-    g_host_alloc_calls++;
+    g_host_alloc_calls.fetch_add(1, std::memory_order_relaxed);
     ene_set_error(ENE_OK, "");
     return ptr;
 }
@@ -436,7 +485,7 @@ int ene_mem_upload_async(void *d_ptr, const void *h_ptr, size_t bytes, void *str
         ene_set_cuda_error(err);
         return g_last_code;
     }
-    g_up_bytes += (unsigned long long)bytes;
+    g_up_bytes.fetch_add((unsigned long long)bytes, std::memory_order_relaxed);
     ene_set_error(ENE_OK, "");
     return ENE_OK;
 }
@@ -457,32 +506,32 @@ int ene_mem_download_async(void *h_ptr, const void *d_ptr, size_t bytes, void *s
         ene_set_cuda_error(err);
         return g_last_code;
     }
-    g_down_bytes += (unsigned long long)bytes;
+    g_down_bytes.fetch_add((unsigned long long)bytes, std::memory_order_relaxed);
     ene_set_error(ENE_OK, "");
     return ENE_OK;
 }
 
 // ---- 统计（供基准脚本验证「稳态零分配」NFR-3）------------------------------
 ENE_EXPORT
-unsigned long long ene_mem_alloc_calls(void) { return g_alloc_calls; }
+unsigned long long ene_mem_alloc_calls(void) { return g_alloc_calls.load(); }
 
 ENE_EXPORT
-unsigned long long ene_mem_free_calls(void) { return g_free_calls; }
+unsigned long long ene_mem_free_calls(void) { return g_free_calls.load(); }
 
 ENE_EXPORT
-unsigned long long ene_mem_upload_bytes(void) { return g_up_bytes; }
+unsigned long long ene_mem_upload_bytes(void) { return g_up_bytes.load(); }
 
 ENE_EXPORT
-unsigned long long ene_mem_download_bytes(void) { return g_down_bytes; }
+unsigned long long ene_mem_download_bytes(void) { return g_down_bytes.load(); }
 
 ENE_EXPORT
-unsigned long long ene_mem_host_alloc_calls(void) { return g_host_alloc_calls; }
+unsigned long long ene_mem_host_alloc_calls(void) { return g_host_alloc_calls.load(); }
 
 ENE_EXPORT
 void ene_mem_reset_counters(void) {
-    g_alloc_calls = 0;
-    g_free_calls  = 0;
-    g_up_bytes    = 0;
-    g_down_bytes  = 0;
-    g_host_alloc_calls = 0;
+    g_alloc_calls.store(0);
+    g_free_calls.store(0);
+    g_up_bytes.store(0);
+    g_down_bytes.store(0);
+    g_host_alloc_calls.store(0);
 }
